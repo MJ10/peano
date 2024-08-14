@@ -958,7 +958,7 @@ class ContrastivePolicy(Policy):
         # the number of classes is different for each contrastive example in the batch.
         for e in batch:
             if e.type == ExampleType.STATE_ACTION:
-                import pdb; pdb.set_trace();
+                # import pdb; pdb.set_trace();
                 p = self.score_arrows([e.positive] + e.negatives, e.state)
                 losses.append(F.cross_entropy(p.unsqueeze(0), torch.zeros((1,), device=p.device, dtype=torch.long)))
             elif e.type != ExampleType.STATE_VALUE:
@@ -986,7 +986,7 @@ class ContrastivePolicy(Policy):
         return torch.cat(outputs, dim=0)
 
     def fit(self,
-            dataset: list[Episode], beams,
+            dataset: list[Episode],
             checkpoint_callback=lambda: None):
         self.train()
 
@@ -1004,6 +1004,8 @@ class ContrastivePolicy(Policy):
         # import pdb; pdb.set_trace();
         for episode in dataset:
             examples.extend(self.extract_examples(episode, all_negatives))
+        
+        print("Training with TB")
 
         for e in range(self.gradient_steps):
             optimizer.zero_grad()
@@ -1025,6 +1027,7 @@ class DiversityPolicy(Policy):
                          hidden_size=config.gru.hidden_size,
                          bidirectional=True,
                          num_layers=config.gru.layers)
+        self.logZ = nn.Parameter(torch.ones(30))
 
         self.arrow_readout = nn.Linear(2*config.gru.hidden_size, 2*config.gru.hidden_size)
         self.outcome_readout = nn.Linear(2*config.gru.hidden_size, 2*config.gru.hidden_size)
@@ -1165,23 +1168,15 @@ class DiversityPolicy(Policy):
 
     def get_loss(self, batch) -> torch.Tensor:
         losses = []
-
-        # HACK: This can be vectorized & batched, but it will be more complicated because
-        # the number of classes is different for each contrastive example in the batch.
-        for e in batch:
-            if e.type == ExampleType.STATE_ACTION:
-                p = self.score_arrows([e.positive] + e.negatives, e.state)
-                losses.append(F.cross_entropy(p.unsqueeze(0), torch.zeros((1,), device=p.device, dtype=torch.long)))
-            elif e.type != ExampleType.STATE_VALUE:
-                raise ValueError(f'Unknown example type {e.type}')
-
-        state_values_x = [e.state for e in batch if e.type == ExampleType.STATE_VALUE]
-
-        if len(state_values_x):
-            y = [e.value for e in batch if e.type == ExampleType.STATE_VALUE]
-            y_hat = self.estimate_values(state_values_x)
-            losses.append(((y_hat - torch.tensor(y, device=y_hat.device))**2).mean())
-
+        for ep in batch:
+            lp = 0
+            log_rew = 0 if ep.success else -20
+            for i, (st, a) in enumerate(zip(ep.states[:-1], ep.actions)):
+                action_probs = self.score_arrows([a] + ep.negative_actions[i], st)
+                action_log_probs = F.log_softmax(action_probs, dim=0)[0]
+                lp += action_log_probs
+            loss = (lp - log_rew + self.logZ) ** 2
+            losses.append(loss)
         return torch.stack(losses, dim=0).mean()
 
     def embed_raw(self, strs: list[str]) -> torch.Tensor:
@@ -1204,24 +1199,24 @@ class DiversityPolicy(Policy):
         optimizer = torch.optim.Adam(self.parameters(), lr=self.lr)
 
         all_negatives = []
-        import pdb; pdb.set_trace();
-        for e in dataset:
-            for i in range(len(e.actions) // 2):
-                all_negatives.append(e.actions[2*i:2*i+2])
+        # import pdb; pdb.set_trace();
+        # for e in dataset:
+        #     for i in range(len(e.actions) // 2):
+        #         all_negatives.append(e.actions[2*i:2*i+2])
 
         # Assemble contrastive examples
-        examples = []
+        # examples = []
 
-        for episode in dataset:
-            examples.extend(self.extract_examples(episode, all_negatives))
+        # for episode in dataset:
+        #     examples.extend(self.extract_examples(episode, all_negatives))
 
         for e in range(self.gradient_steps):
             optimizer.zero_grad()
-            batch = random.sample(examples, k=min(len(examples), self.batch_size))
+            batch = random.sample(dataset, k=min(len(dataset), self.batch_size))
             loss = self.get_loss(batch)
             loss.backward()
             optimizer.step()
-
+            print("Loss: ", loss.item())
             wandb.log({'train_loss': loss.cpu()})
 
             checkpoint_callback()

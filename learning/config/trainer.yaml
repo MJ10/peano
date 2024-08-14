@@ -27,7 +27,7 @@ trainer:
     epsilon: 0.1
     algorithm: 'policy-beam-search'
     accumulate: true
-
+    gpus: [0, 0]
     induce_tactics: true
     n_tactics: 3
     min_tactic_score: 50
