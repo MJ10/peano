@@ -21,7 +21,7 @@ from domain import Domain, Problem, make_domain
 from utility import SearchHeuristic, GRUUtilityFunction, TwoStageUtilityFunction, LengthUtilityFunction
 from episode import ProofSearchEpisode
 from util import get_device
-from policy import ContrastivePolicy, RandomPolicy
+from policy import BeamElement, ContrastivePolicy, RandomPolicy
 
 
 MAX_NEGATIVES = 10000
@@ -323,6 +323,7 @@ def test_search_heuristic_hyperparams(name, group_fn, depth_weight, max_depth=40
 @dataclass
 class SearcherResults:
     episodes: list[ProofSearchEpisode]
+    # beams: list[BeamElement]
 
     def successes(self):
         return sum(1 for e in self.episodes if e.success)
@@ -352,6 +353,7 @@ class SearcherAgent:
 
     def run_batch(self, seeds) -> SearcherResults:
         episodes = []
+        beams = []
         successes = 0
 
         for seed in tqdm(seeds):
@@ -395,6 +397,7 @@ class SearcherAgent:
                 successes += 1
 
             episodes.append(episode)
+            # beams.append(beam)
 
         return SearcherResults(episodes)
 

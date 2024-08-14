@@ -20,7 +20,7 @@ from utility import GRUUtilityFunction, LengthUtilityFunction, TwoStageUtilityFu
 from util import get_device
 from episode import ProofSearchEpisode
 from search import SearcherAgent, SearcherResults, run_search_on_batch, load_search_model
-from policy import ContrastivePolicy, RandomPolicy
+from policy import ContrastivePolicy, RandomPolicy, DiversityPolicy
 from tactics import induce_tactics, rewrite_episode_using_tactics
 
 
@@ -43,7 +43,7 @@ def spawn_searcher(rank, iteration, domain, tactics, max_nodes, max_depth,
             return pickle.load(f)
 
     algorithm = ('policy-beam-search'
-                 if model_type in ('contrastive-policy', 'random-policy')
+                 if model_type in ('diversity-policy', 'contrastive-policy', 'random-policy')
                  else 'best-first-search')
 
     agent = SearcherAgent(make_domain(domain, tactics),
@@ -131,6 +131,8 @@ class TrainerAgent:
                 m = GRUUtilityFunction(self.config.model)
             elif self.config.model.type == 'contrastive-policy':
                 m = ContrastivePolicy(self.config.model)
+            elif self.config.model.type == 'diversity-policy':
+                m = DiversityPolicy(self.config.model)
             elif self.config.model.type == 'random-policy':
                 m = RandomPolicy()
         else:
@@ -191,25 +193,26 @@ class TrainerAgent:
                     logger.info('Evaluating...')
                     success_rate = {}
 
-                    for d in self.eval_domains:
-                        if not os.path.exists(f'eval-episodes-{d}-{it}.pkl'):
-                            eval_results = run_search_on_batch(
-                                make_domain(d, tactics),
-                                eval_seeds,
-                                m,
-                                self.algorithm,
-                                self.max_nodes,
-                                self.max_depth,
-                                output_path=f'eval-episodes-{d}-{it}.pkl',
-                                debug=False,
-                                epsilon=0,
-                            )
+                    if self.config.do_eval:
+                        for d in self.eval_domains:
+                            if not os.path.exists(f'eval-episodes-{d}-{it}.pkl'):
+                                eval_results = run_search_on_batch(
+                                    make_domain(d, tactics),
+                                    eval_seeds,
+                                    m,
+                                    self.algorithm,
+                                    self.max_nodes,
+                                    self.max_depth,
+                                    output_path=f'eval-episodes-{d}-{it}.pkl',
+                                    debug=False,
+                                    epsilon=0,
+                                )
 
-                            wandb.log({f'success_rate_{d}': eval_results.success_rate()})
-                            success_rate[d] = eval_results.success_rate()
+                                wandb.log({f'success_rate_{d}': eval_results.success_rate()})
+                                success_rate[d] = eval_results.success_rate()
 
                     existing_episodes = len(episodes)
-
+                    # beams = []
                     # Aggregate episodes from searchers.
                     for i, f in enumerate(self.searcher_futures):
                         logger.info('Waiting for searcher #%d...', i)
@@ -226,6 +229,7 @@ class TrainerAgent:
                                 result_i.episodes[j], d, tactics)
 
                         episodes.extend(result_i.episodes)
+                        # beams.extend(result_i.beams)
 
                     # Index of the first episode to use for training.
                     start_index = (0 if self.accumulate else existing_episodes)

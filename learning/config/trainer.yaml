@@ -17,7 +17,7 @@ trainer:
     passing_grade: 0.9
     adjust_search_budget_threshold: -1
     search_budget_multiplier: 1
-
+    do_eval: false
     iterations: 50
     batch_size: 50
     n_searchers: 5

@@ -294,7 +294,7 @@ class Policy(nn.Module):
 
                 if done_solution is not None:
                     logger.debug('Solution state: %s', done_solution)
-                    return recover_episode(problem, done_solution, True)
+                    return recover_episode(problem, done_solution, True)# , done_solution
 
                 if it == depth:
                     # On the extra iteration, just check if we have a solution, but otherwise
@@ -336,8 +336,8 @@ class Policy(nn.Module):
                 for e in beam:
                     e.solution = e.solution.push_action(e.action, problem.domain)
                     e.state = e.solution.format(MAX_STATE_LENGTH)
-
-            return recover_episode(problem, beam[0] if beam else None, False)
+            # import pdb; pdb.set_trace();
+            return recover_episode(problem, beam[0] if beam else None, False)# , beam[0] if beam else None
 
     def best_first_search(self, domain: Domain, problem: Problem,
                           max_nodes: int) -> Episode:
@@ -954,6 +954,217 @@ class ContrastivePolicy(Policy):
 
     def get_loss(self, batch) -> torch.Tensor:
         losses = []
+        # HACK: This can be vectorized & batched, but it will be more complicated because
+        # the number of classes is different for each contrastive example in the batch.
+        for e in batch:
+            if e.type == ExampleType.STATE_ACTION:
+                import pdb; pdb.set_trace();
+                p = self.score_arrows([e.positive] + e.negatives, e.state)
+                losses.append(F.cross_entropy(p.unsqueeze(0), torch.zeros((1,), device=p.device, dtype=torch.long)))
+            elif e.type != ExampleType.STATE_VALUE:
+                raise ValueError(f'Unknown example type {e.type}')
+
+        state_values_x = [e.state for e in batch if e.type == ExampleType.STATE_VALUE]
+
+        if len(state_values_x):
+            y = [e.value for e in batch if e.type == ExampleType.STATE_VALUE]
+            y_hat = self.estimate_values(state_values_x)
+            losses.append(((y_hat - torch.tensor(y, device=y_hat.device))**2).mean())
+
+        return torch.stack(losses, dim=0).mean()
+
+    def embed_raw(self, strs: list[str]) -> torch.Tensor:
+        strs = [s[:self.max_len] for s in strs]
+        outputs = []
+
+        for b in batch_strings(strs, batch_size=4096):
+            input = encode_batch(b, self.get_device(), bos=True, eos=True)
+            input = self.embedding(input.transpose(0, 1))
+            lm_output, _ = self.lm(input)
+            outputs.append(lm_output[0, :, :])
+
+        return torch.cat(outputs, dim=0)
+
+    def fit(self,
+            dataset: list[Episode], beams,
+            checkpoint_callback=lambda: None):
+        self.train()
+
+        optimizer = torch.optim.Adam(self.parameters(), lr=self.lr)
+
+        all_negatives = []
+
+        for e in dataset:
+            for i in range(len(e.actions) // 2):
+                all_negatives.append(e.actions[2*i:2*i+2])
+
+        # Assemble contrastive examples
+        examples = []
+
+        # import pdb; pdb.set_trace();
+        for episode in dataset:
+            examples.extend(self.extract_examples(episode, all_negatives))
+
+        for e in range(self.gradient_steps):
+            optimizer.zero_grad()
+            batch = random.sample(examples, k=min(len(examples), self.batch_size))
+            loss = self.get_loss(batch)
+            loss.backward()
+            optimizer.step()
+
+            wandb.log({'train_loss': loss.cpu()})
+
+            checkpoint_callback()
+
+
+class DiversityPolicy(Policy):
+    def __init__(self, config):
+        super().__init__()
+
+        self.lm = nn.GRU(input_size=config.gru.embedding_size,
+                         hidden_size=config.gru.hidden_size,
+                         bidirectional=True,
+                         num_layers=config.gru.layers)
+
+        self.arrow_readout = nn.Linear(2*config.gru.hidden_size, 2*config.gru.hidden_size)
+        self.outcome_readout = nn.Linear(2*config.gru.hidden_size, 2*config.gru.hidden_size)
+        self.value_readout = nn.Sequential(
+            nn.Linear(2*config.gru.hidden_size, 2*config.gru.hidden_size),
+            nn.ReLU(),
+            nn.Linear(2*config.gru.hidden_size, 1)
+        )
+
+        self.embedding = nn.Embedding(128, config.gru.embedding_size)
+        self.discard_unsolved = config.discard_unsolved
+        self.train_value_function = config.train_value_function
+
+        # Truncate states/actions to avoid OOMs.
+        self.max_len = MAX_STATE_LENGTH
+        self.discount = 0.99
+        self.batch_size = config.batch_size
+        self.lr = config.lr
+        self.gradient_steps = config.gradient_steps
+        self.solution_augmentation_probability = config.solution_augmentation_probability
+        self.solution_augmentation_rate = config.solution_augmentation_rate
+
+
+    def score_arrows(self, arrows: list[str], state: str) -> torch.Tensor:
+        if len(arrows) <= 1:
+            return torch.ones(len(arrows), dtype=torch.float, device=self.get_device())
+        # state_embedding : (1, H)
+        state_embedding = self.embed_states([state])
+        # arrow_embedding : (B, H)
+        arrow_embeddings = self.embed_arrows(arrows)
+        # state_t : (H, 1)
+        state_t = self.arrow_readout(state_embedding).transpose(0, 1)
+        # Result: (B,)
+        return arrow_embeddings.matmul(state_t).squeeze(1)
+
+    def score_outcomes(self, outcomes: list[str], action: str, state: str) -> torch.Tensor:
+        if len(outcomes) <= 1:
+            return torch.ones(len(outcomes), dtype=torch.float, device=self.get_device())
+        # state_embedding : (1, H)
+        state_embedding = self.embed_states([state])
+        # outcome_embeddings : (B, H)
+        outcome_embeddings = self.embed_outcomes(outcomes)
+        # state_t : (H, 1)
+        state_t = self.outcome_readout(state_embedding).transpose(0, 1)
+        # Result: (B,)
+        return outcome_embeddings.matmul(state_t).squeeze(1)
+
+    def estimate_values(self, states: list[str]) -> torch.Tensor:
+        logger.debug('Estimating values for %d states, maxlen = %d',
+                     len(states), max(map(len, states)))
+        state_embedding = self.embed_states(states)
+        return self.value_readout(state_embedding).squeeze(1)
+
+    def get_device(self):
+        return self.embedding.weight.device
+
+    def extract_examples(self, episode, random_negatives=[]) -> list[ContrastivePolicyExample]:
+        examples = []
+
+        if not episode.success and self.discard_unsolved:
+            return examples
+
+        if isinstance(episode, Episode):
+            for i, a in enumerate(episode.actions):
+                if episode.success:
+                    if episode.negative_actions[i]:
+                        examples.append(ContrastivePolicyExample(type=ExampleType.STATE_ACTION,
+                                                                 state=episode.states[i],
+                                                                 positive=a,
+                                                                 negatives=episode.negative_actions[i]))
+
+                        if random_negatives and \
+                           random.random() < self.solution_augmentation_probability:
+                            examples.extend(self._perform_augmentation(episode, random_negatives))
+
+            if self.train_value_function:
+                for i, s in enumerate(episode.states):
+                    value = (0 if not episode.success
+                             else self.discount ** (len(episode.states) - (i + 1)))
+                    examples.append(ContrastivePolicyExample(type=ExampleType.STATE_VALUE,
+                                                             state=episode.states[i],
+                                                             value=value))
+        elif isinstance(episode, TreeSearchEpisode):
+            for node in episode.visited:
+                examples.append(ContrastivePolicyExample(type=ExampleType.STATE_VALUE,
+                                                         state=node.state,
+                                                         value=node.value_target))
+
+        return examples
+
+    def _perform_augmentation(self, episode, random_negatives):
+        # Add a few random negatives to the solution
+        augmented_actions = []
+
+        # How many to insert.
+        n_insertions = np.random.geometric(p=self.solution_augmentation_rate)
+        # Where to insert random steps.
+        queue = sorted(random.choices(list(range(len(episode.actions) // 2)),
+                                      k=n_insertions), reverse=True)
+        is_augmentation = []
+        positives, negatives = [], []
+
+        for i in range(len(episode.actions) // 2):
+            while queue and queue[-1] == i:
+                queue.pop()
+                augmented_actions.extend(random.choice(random_negatives))
+
+                if random.random() < 0.5:
+                    augmented_actions[-1] = '_'
+
+                positives.extend(episode.actions[2*i:2*i+2])
+                negatives.extend(episode.negative_actions[2*i:2*i+2])
+                is_augmentation.append(True)
+
+            augmented_actions.extend(episode.actions[2*i:2*i+2])
+            positives.extend(episode.actions[2*i:2*i+2])
+            negatives.extend(episode.negative_actions[2*i:2*i+2])
+            is_augmentation.append(False)
+
+        augmentations = []
+
+        states = Solution.states_from_episode(episode.problem, episode.goal,
+                                              augmented_actions)
+
+        assert len(states) == 1 + len(augmented_actions)
+
+        for i in range(len(is_augmentation)):
+            if i and is_augmentation[i-1]:
+                augmentations.append(ContrastivePolicyExample(
+                    type=ExampleType.STATE_ACTION,
+                    state=states[2*i],
+                    positive=positives[2*i],
+                    negatives=negatives[2*i]
+                ))
+
+        return augmentations
+
+
+    def get_loss(self, batch) -> torch.Tensor:
+        losses = []
 
         # HACK: This can be vectorized & batched, but it will be more complicated because
         # the number of classes is different for each contrastive example in the batch.
@@ -993,7 +1204,7 @@ class ContrastivePolicy(Policy):
         optimizer = torch.optim.Adam(self.parameters(), lr=self.lr)
 
         all_negatives = []
-
+        import pdb; pdb.set_trace();
         for e in dataset:
             for i in range(len(e.actions) // 2):
                 all_negatives.append(e.actions[2*i:2*i+2])
