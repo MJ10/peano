@@ -1169,15 +1169,19 @@ class DiversityPolicy(Policy):
     def get_loss(self, batch) -> torch.Tensor:
         losses = []
         for ep in batch:
+            if len(ep.states) == 0:
+                continue
             lp = 0
             log_rew = 0 if ep.success else -20
+            logz = self.estimate_values([ep.states[0]]).squeeze(0)
             for i, (st, a) in enumerate(zip(ep.states[:-1], ep.actions)):
                 action_probs = self.score_arrows([a] + ep.negative_actions[i], st)
                 action_log_probs = F.log_softmax(action_probs, dim=0)[0]
                 lp += action_log_probs
-            loss = (lp - log_rew + self.logZ) ** 2
+            loss = (lp - log_rew + logz) ** 2
             losses.append(loss)
-        return torch.stack(losses, dim=0).mean()
+        loss = torch.stack(losses, dim=0)
+        return loss.mean()
 
     def embed_raw(self, strs: list[str]) -> torch.Tensor:
         strs = [s[:self.max_len] for s in strs]
@@ -1209,10 +1213,17 @@ class DiversityPolicy(Policy):
 
         # for episode in dataset:
         #     examples.extend(self.extract_examples(episode, all_negatives))
+        positives = [i for i, e in enumerate(dataset) if e.success]
+        negatives = [i for i, e in enumerate(dataset) if not e.success]
 
         for e in range(self.gradient_steps):
             optimizer.zero_grad()
-            batch = random.sample(dataset, k=min(len(dataset), self.batch_size))
+            batch_pos_idx = random.sample(positives, k=min(len(positives), self.batch_size // 2))
+            batch_neg_idx = random.sample(negatives, k=min(len(negatives), self.batch_size // 2))
+            batch_pos = [dataset[i] for i in batch_pos_idx]
+            batch_neg = [dataset[i] for i in batch_neg_idx]
+            batch = batch_pos + batch_neg
+            # batch = random.sample(dataset, k=min(len(dataset), self.batch_size))
             loss = self.get_loss(batch)
             loss.backward()
             optimizer.step()
