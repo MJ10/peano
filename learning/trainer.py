@@ -31,7 +31,7 @@ MAX_NODES_LIMIT = 50000
 
 
 def spawn_searcher(rank, iteration, domain, tactics, max_nodes, max_depth,
-                   epsilon, model_type, model_path, seeds, device):
+                   epsilon, model_type, model_path, seeds, device, on_policy=False):
     out_path = (f'rollouts/it{iteration}/searcher{rank}.pt'
                 if rank is not None
                 else None)
@@ -45,6 +45,7 @@ def spawn_searcher(rank, iteration, domain, tactics, max_nodes, max_depth,
     algorithm = ('policy-beam-search'
                  if model_type in ('diversity-policy', 'contrastive-policy', 'random-policy')
                  else 'best-first-search')
+    algorithm = 'on-policy-sample' if on_policy else algorithm
 
     agent = SearcherAgent(make_domain(domain, tactics),
                           m, max_nodes, max_depth,
@@ -172,6 +173,8 @@ class TrainerAgent:
                                 self.get_train_domain(curriculum_steps), max_nodes)
                     wandb.log({'max_nodes': max_nodes,
                                'curriculum_steps': curriculum_steps})
+                    is_on_policy = [i < int(self.config.on_policy_frac*self.n_searchers) 
+                                    for i in range(self.n_searchers)]
                     for j in range(self.n_searchers):
                         params = {
                             'iteration': it,
@@ -185,15 +188,16 @@ class TrainerAgent:
                             'model_path': last_checkpoint,
                             'seeds': random.choices(seeds, k=self.batch_size),
                             'device': self._get_searcher_device(j),
+                            'on_policy': is_on_policy[j],
                         }
                         logging.info('Searcher parameters: %s', str(params))
                         self.searcher_futures.append(executor.submit(spawn_searcher,
                                                                      **params))
                     # Evaluate the current agent.
-                    logger.info('Evaluating...')
-                    success_rate = {}
 
-                    if self.config.do_eval:
+                    if self.config.do_eval and it % self.config.eval_freq == 0:
+                        logger.info('Evaluating...')
+                        success_rate = {}
                         for d in self.eval_domains:
                             if not os.path.exists(f'eval-episodes-{d}-{it}.pkl'):
                                 eval_results = run_search_on_batch(
@@ -214,6 +218,8 @@ class TrainerAgent:
                     existing_episodes = len(episodes)
                     # beams = []
                     # Aggregate episodes from searchers.
+                    on_policy_success = 0
+                    on_policy_eps = 0
                     for i, f in enumerate(self.searcher_futures):
                         logger.info('Waiting for searcher #%d...', i)
                         try:
@@ -227,9 +233,16 @@ class TrainerAgent:
                             d = make_domain(result_i.episodes[j].domain, tactics)
                             result_i.episodes[j] = rewrite_episode_using_tactics(
                                 result_i.episodes[j], d, tactics)
+                            if is_on_policy[i]:
+                                on_policy_success += result_i.episodes[j].success
+                                on_policy_eps += 1
 
                         episodes.extend(result_i.episodes)
+
                         # beams.extend(result_i.beams)
+                    if sum(is_on_policy) > 0:
+                        print(f'On policy success rate: {on_policy_success / on_policy_eps}')
+                        wandb.log({'on_policy_success_rate': on_policy_success / on_policy_eps})
 
                     # Index of the first episode to use for training.
                     start_index = (0 if self.accumulate else existing_episodes)

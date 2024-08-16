@@ -264,6 +264,61 @@ class Policy(nn.Module):
     def next_state(self, state: Any, observation: str) -> Any:
         'Implements the recurrent rule to update the hidden state.'
         raise NotImplementedError()
+    
+    def on_policy_sample(self,
+                         problem: Problem,
+                         depth: int,
+                         temperature: float = 1,
+                         epsilon: float = 0) -> Episode:
+        # raise NotImplementedError()
+        with torch.no_grad():
+            initial_sol = Solution.from_problem(problem)
+            beam = BeamElement(solution=initial_sol,
+                                state=initial_sol.format(MAX_STATE_LENGTH),
+                                logprob=0.0)
+            for it in range(depth + 1):
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(f'Beam #{it}:')
+                    logger.debug('  %s', beam)
+                done_solution = problem.domain.derivation_done(beam.solution.derivation)
+                
+                if done_solution:
+                    logger.debug('Solution state: %s', done_solution)
+                    return recover_episode(problem, beam, True)
+                
+                if it == depth:
+                    break
+                
+                take_random_action = random.random() < epsilon
+                actions = beam.solution.successors(problem.domain)
+                if len(actions) == 0:
+                    return recover_episode(problem, beam, False)
+                action_probs = (self.score_arrows([a.value for a in actions], beam.state) /
+                                 temperature).softmax(-1)
+
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug('Arrow probabilities:')
+                    logger.debug('  %s => %s', beam.state,
+                                 sorted(list(zip(actions, action_probs)),
+                                        key=lambda aap: aap[1], reverse=True))
+                if take_random_action:
+                    action = random.sample(actions, 1)[0]
+                else:
+                    if len(action_probs) == 1:
+                        action = actions[0]
+                    else:
+                        action = actions[torch.multinomial(action_probs, 1).item()]
+                
+                beam = BeamElement(solution=beam.solution,
+                                      state=beam.state,
+                                      action=action,
+                                      logprob=beam.logprob + log(action_probs[actions.index(action)].item()),
+                                      parent=beam,
+                                      negative_actions=[a.value for a in actions if a != action])
+                                   
+                beam.solution = beam.solution.push_action(action, problem.domain)
+                beam.state = beam.solution.format(MAX_STATE_LENGTH)
+            return recover_episode(problem, beam, False)
 
     def beam_search(self,
                     problem: Problem,

@@ -5,22 +5,25 @@ eval_interval: [0, 100]
 
 trainer:
     train_domains:
-        - mix(subst-eval, comb-like, one-step-add-eq, one-step-mul-eq, two-step-eq)
+        # - mix(subst-eval, comb-like, one-step-add-eq, one-step-mul-eq, two-step-eq)
+        - subst-eval
 
     eval_domains:
         - subst-eval
-        - comb-like
-        - one-step-add-eq
-        - one-step-mul-eq
-        - two-step-eq
+        # - comb-like
+        # - one-step-add-eq
+        # - one-step-mul-eq
+        # - two-step-eq
 
     passing_grade: 0.9
     adjust_search_budget_threshold: -1
     search_budget_multiplier: 1
     do_eval: false
+    on_policy_frac: 0.
+    eval_freq: 5
     iterations: 50
     batch_size: 50
-    n_searchers: 5
+    n_searchers: 6
     max_depth: 18
     max_nodes: 1000
     rerank_top_k: 200

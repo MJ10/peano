@@ -391,6 +391,11 @@ class SearcherAgent:
                         depth=self.max_depth,
                         beam_size=math.ceil(self.max_nodes / self.max_depth),
                         epsilon=self.epsilon)
+                elif self.algorithm == 'on-policy-sample':
+                    episode = self.model.on_policy_sample(
+                        problem,
+                        depth=self.max_depth,
+                        epsilon=self.epsilon)
 
             if episode.success:
                 logger.info('Solved %s', episode.problem)
