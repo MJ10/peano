@@ -159,6 +159,7 @@ class TrainerAgent:
         last_train_success_rate = 0
 
         for it in range(iteration, self.config.iterations):
+            metrics = {}
             with ProcessPoolExecutor() as executor:
                 logger.info("### Iteration %d ###", it)
 
@@ -171,8 +172,11 @@ class TrainerAgent:
                     # Spawn N searchers.
                     logger.info('Spawning searchers on %s, max_nodes = %d...',
                                 self.get_train_domain(curriculum_steps), max_nodes)
-                    wandb.log({'max_nodes': max_nodes,
-                               'curriculum_steps': curriculum_steps})
+                    # wandb.log({'max_nodes': max_nodes,
+                    #            'curriculum_steps': curriculum_steps})
+                    metrics['max_nodes'] = max_nodes
+                    metrics['curriculum_steps'] = curriculum_steps
+                    
                     is_on_policy = [i < int(self.config.on_policy_frac*self.n_searchers) 
                                     for i in range(self.n_searchers)]
                     for j in range(self.n_searchers):
@@ -211,9 +215,10 @@ class TrainerAgent:
                                     debug=False,
                                     epsilon=0,
                                 )
-
-                                wandb.log({f'success_rate_{d}': eval_results.success_rate()})
+                                # wandb.log({f'success_rate_{d}': eval_results.success_rate()})
                                 success_rate[d] = eval_results.success_rate()
+                                metrics.update({f'success_rate_{d}': eval_results.success_rate()})
+                                logger.info('Evaluated %s: %f', d, eval_results.success_rate())
 
                     existing_episodes = len(episodes)
                     # beams = []
@@ -242,7 +247,8 @@ class TrainerAgent:
                         # beams.extend(result_i.beams)
                     if sum(is_on_policy) > 0:
                         print(f'On policy success rate: {on_policy_success / on_policy_eps}')
-                        wandb.log({'on_policy_success_rate': on_policy_success / on_policy_eps})
+                        metrics['on_policy_success_rate'] = on_policy_success / on_policy_eps
+                        # wandb.log({'on_policy_success_rate': on_policy_success / on_policy_eps})
 
                     # Index of the first episode to use for training.
                     start_index = (0 if self.accumulate else existing_episodes)
@@ -287,8 +293,9 @@ class TrainerAgent:
                     train_success_rate = (sum(e.success 
                                               for e in episodes[existing_episodes:]) / 
                                           (max(1, len(episodes) - existing_episodes)))
-
-                    wandb.log({'train_success_rate': train_success_rate})
+                    print(f'Train success rate: {train_success_rate}')
+                    metrics['train_success_rate'] = train_success_rate
+                    # wandb.log({'train_success_rate': train_success_rate})
 
                     if train_success_rate >= self.passing_grade:
                         curriculum_steps += 1
@@ -312,9 +319,11 @@ class TrainerAgent:
                 logger.info('Training model on %d episodes (%d successful)',
                             len(episodes) - start_index,
                             sum(1 for e in episodes[start_index:] if e.success))
-                m.fit(episodes[start_index:])
+                logs = m.fit(episodes[start_index:])
                 last_checkpoint = os.path.join(os.getcwd(), f'{it}.pt')
-
+                metrics.update({k: v for k, v in logs.items()})
+                print(metrics)
+                wandb.log(metrics)
                 torch.save(m, last_checkpoint)
                 logger.info('Wrote %s', last_checkpoint)
 

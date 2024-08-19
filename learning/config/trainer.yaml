@@ -20,10 +20,10 @@ trainer:
     search_budget_multiplier: 1
     do_eval: false
     on_policy_frac: 0.
-    eval_freq: 5
-    iterations: 50
+    eval_freq: 10
+    iterations: 500
     batch_size: 50
-    n_searchers: 6
+    n_searchers: 12
     max_depth: 18
     max_nodes: 1000
     rerank_top_k: 200
@@ -31,7 +31,7 @@ trainer:
     algorithm: 'policy-beam-search'
     accumulate: true
     gpus: [0, 0]
-    induce_tactics: true
+    induce_tactics: false
     n_tactics: 3
     min_tactic_score: 50
 
@@ -56,7 +56,10 @@ trainer:
 
 job:
     wandb_project: peano
+    name: test_exp
 
 hydra:
+    run:
+        dir: /network/scratch/m/moksh.jain/peano_experiments/${job.name}/${now:%Y.%m.%d}/${now:%H%M%S}
     job:
         chdir: true

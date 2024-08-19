@@ -408,7 +408,9 @@ class SearcherAgent:
 
 
 def run_search_on_batch(domain, seeds, model, algorithm, max_nodes,
-                        max_depth, epsilon, output_path, debug):
+                        max_depth, epsilon, output_path, debug, on_policy=False):
+    if on_policy:
+        algorithm = 'on-policy-sample'
     searcher = SearcherAgent(domain, model, max_nodes, max_depth,
                              epsilon, algorithm, debug)
 

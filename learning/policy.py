@@ -1060,18 +1060,21 @@ class ContrastivePolicy(Policy):
         for episode in dataset:
             examples.extend(self.extract_examples(episode, all_negatives))
         
-        print("Training with TB")
-
+        losses = []
         for e in range(self.gradient_steps):
             optimizer.zero_grad()
             batch = random.sample(examples, k=min(len(examples), self.batch_size))
             loss = self.get_loss(batch)
             loss.backward()
             optimizer.step()
-
-            wandb.log({'train_loss': loss.cpu()})
+            losses.append(loss.item())
+            # wandb.log({'train_loss': loss.cpu()})
 
             checkpoint_callback()
+        return {
+            'loss': np.mean(losses),
+            # 'losses': losses
+        }        
 
 
 class DiversityPolicy(Policy):
@@ -1270,7 +1273,7 @@ class DiversityPolicy(Policy):
         #     examples.extend(self.extract_examples(episode, all_negatives))
         positives = [i for i, e in enumerate(dataset) if e.success]
         negatives = [i for i, e in enumerate(dataset) if not e.success]
-
+        losses = []
         for e in range(self.gradient_steps):
             optimizer.zero_grad()
             batch_pos_idx = random.sample(positives, k=min(len(positives), self.batch_size // 2))
@@ -1283,9 +1286,13 @@ class DiversityPolicy(Policy):
             loss.backward()
             optimizer.step()
             print("Loss: ", loss.item())
-            wandb.log({'train_loss': loss.cpu()})
+            losses.append(loss.item())
+            # wandb.log({'train_loss': loss.cpu()})
 
             checkpoint_callback()
+        return {
+            "loss": sum(losses) / len(losses)
+        }
 
 
 class TestDataPreparation(unittest.TestCase):

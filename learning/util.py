@@ -230,6 +230,7 @@ def setup_wandb(cfg: DictConfig):
             cfg.job.cwd = os.getcwd()
         wandb.init(
                 project=cfg.job.wandb_project,
+                name=cfg.job.name,
                 config=OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True))
         for key in logging.Logger.manager.loggerDict.keys():
             if key.startswith('wandb'):
