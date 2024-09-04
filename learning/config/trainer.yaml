@@ -33,6 +33,7 @@ trainer:
     load_tactics_seq: null
     load_tactics_init: null
     load_trajectories: null
+    do_on_policy_eval: false
     gpus: [0, 0]
     induce_tactics: true
     n_tactics: 3

@@ -234,26 +234,47 @@ class TrainerAgent:
                                                                      **params))
                     # Evaluate the current agent.
 
-                    if self.config.do_eval and it % self.config.eval_freq == 0:
-                        logger.info('Evaluating...')
-                        success_rate = {}
-                        for d in self.eval_domains:
-                            if not os.path.exists(f'eval-episodes-{d}-{it}.pkl'):
-                                eval_results = run_search_on_batch(
-                                    make_domain(d, tactics),
-                                    eval_seeds,
-                                    m,
-                                    self.algorithm,
-                                    self.max_nodes,
-                                    self.max_depth,
-                                    output_path=f'eval-episodes-{d}-{it}.pkl',
-                                    debug=False,
-                                    epsilon=0,
-                                )
-                                # wandb.log({f'success_rate_{d}': eval_results.success_rate()})
-                                success_rate[d] = eval_results.success_rate()
-                                metrics.update({f'success_rate_{d}': eval_results.success_rate()})
-                                logger.info('Evaluated %s: %f', d, eval_results.success_rate())
+                    if it % self.config.eval_freq == 0:
+                        if self.config.do_eval:
+                            logger.info('Evaluating...')
+                            success_rate = {}
+                            for d in self.eval_domains:
+                                if not os.path.exists(f'eval-episodes-{d}-{it}.pkl'):
+                                    eval_results = run_search_on_batch(
+                                        make_domain(d, tactics),
+                                        eval_seeds,
+                                        m,
+                                        self.algorithm,
+                                        self.max_nodes,
+                                        self.max_depth,
+                                        output_path=f'eval-episodes-{d}-{it}.pkl',
+                                        debug=False,
+                                        epsilon=0,
+                                    )
+                                    # wandb.log({f'success_rate_{d}': eval_results.success_rate()})
+                                    success_rate[d] = eval_results.success_rate()
+                                    metrics.update({f'success_rate_{d}': eval_results.success_rate()})
+                                    logger.info('Evaluated %s: %f', d, eval_results.success_rate())
+                        if self.config.do_on_policy_eval:
+                            logger.info('Evaluating on-policy...')
+                            on_policy_success_rate = {}
+                            for d in self.train_domains:
+                                if not os.path.exists(f'on-policy-episodes-{d}-{it}.pkl'):
+                                    eval_results = run_search_on_batch(
+                                        make_domain(d, tactics),
+                                        eval_seeds,
+                                        m,
+                                        self.algorithm,
+                                        self.max_nodes,
+                                        self.max_depth,
+                                        output_path=f'on-policy-eval-episodes-{d}-{it}.pkl',
+                                        debug=False,
+                                        epsilon=0,
+                                        on_policy=True
+                                    )
+                                    on_policy_success_rate[d] = eval_results.success_rate()
+                                    metrics.update({f'on_policy_success_rate_{d}': eval_results.success_rate()})
+                                    logger.info('Evaluated %s: %f', d, eval_results.success_rate())
 
                     existing_episodes = len(episodes)
                     # beams = []
