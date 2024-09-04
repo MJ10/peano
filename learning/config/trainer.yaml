@@ -5,22 +5,22 @@ eval_interval: [0, 100]
 
 trainer:
     train_domains:
-        # - mix(subst-eval, comb-like, one-step-add-eq, one-step-mul-eq, two-step-eq)
-        - subst-eval
+        - mix(subst-eval, comb-like, one-step-add-eq, one-step-mul-eq, two-step-eq)
+        # - subst-eval
 
     eval_domains:
         - subst-eval
-        # - comb-like
-        # - one-step-add-eq
-        # - one-step-mul-eq
-        # - two-step-eq
+        - comb-like
+        - one-step-add-eq
+        - one-step-mul-eq
+        - two-step-eq
 
     passing_grade: 0.9
     adjust_search_budget_threshold: -1
     search_budget_multiplier: 1
     do_eval: false
-    on_policy_frac: 0.
-    eval_freq: 10
+    on_policy_frac: 1.
+    eval_freq: 250
     iterations: 500
     batch_size: 50
     n_searchers: 12
@@ -30,10 +30,14 @@ trainer:
     epsilon: 0.1
     algorithm: 'policy-beam-search'
     accumulate: true
+    load_tactics_seq: null
+    load_tactics_init: null
+    load_trajectories: null
     gpus: [0, 0]
-    induce_tactics: false
+    induce_tactics: true
     n_tactics: 3
     min_tactic_score: 50
+    load_past_exp_trajectories: null
 
     model:
         type: contrastive-policy

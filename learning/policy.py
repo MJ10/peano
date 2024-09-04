@@ -1085,7 +1085,6 @@ class DiversityPolicy(Policy):
                          hidden_size=config.gru.hidden_size,
                          bidirectional=True,
                          num_layers=config.gru.layers)
-        self.logZ = nn.Parameter(torch.ones(30))
 
         self.arrow_readout = nn.Linear(2*config.gru.hidden_size, 2*config.gru.hidden_size)
         self.outcome_readout = nn.Linear(2*config.gru.hidden_size, 2*config.gru.hidden_size)
@@ -1223,6 +1222,54 @@ class DiversityPolicy(Policy):
 
         return augmentations
 
+    def score_arrows_batch(self, batch_arrows: list[list[str]], batch_states: list[str]) -> torch.Tensor:
+        # Compute state embeddings for the entire batch (batch_size, H)
+        state_embeddings = self.embed_states(batch_states)
+        
+        # Compute arrow embeddings for the entire batch and pad them
+        max_num_arrows = max(len(arrows) for arrows in batch_arrows)
+        padded_arrows = [arrows + [EMPTY] * (max_num_arrows - len(arrows)) for arrows in batch_arrows]  # padding with empty strings
+        flat_arrows = [arrow for arrows in padded_arrows for arrow in arrows]  # flatten the list of lists
+
+        # Embed all arrows in the batch and reshape them back to (batch_size, max_num_arrows, H)
+        arrow_embeddings = self.embed_arrows(flat_arrows).view(len(batch_states), max_num_arrows, -1)
+        
+        # Compute dot product scores between state and arrows
+        state_transformed = self.arrow_readout(state_embeddings).unsqueeze(1)  # (batch_size, 1, H)
+        scores = torch.bmm(arrow_embeddings, state_transformed.transpose(1, 2)).squeeze(-1)  # (batch_size, max_num_arrows)
+
+        # Create a mask for padded arrows
+        mask = torch.tensor([[0 if arrow != EMPTY else -1e9 for arrow in arrows] for arrows in padded_arrows], device=scores.device)
+        
+        # Apply mask to ignore padded elements
+        scores = scores + mask.float()
+
+        return scores
+
+    def get_loss_batch(self, batch) -> torch.Tensor:
+        log_rews = torch.tensor([0 if e.success else -20 for e in batch], device=self.get_device())
+        lens = [len(e.actions) for e in batch]
+        max_len = max(lens)
+        log_probs = torch.zeros((len(batch), max_len), device=self.get_device())
+
+        for step in range(max_len):
+            states = []
+            actions = []
+            for e in batch:
+                try:
+                    states.append(e.states[step] if step < len(e.states) - 1 else e.states[-1])
+                except:
+                    import pdb; pdb.set_trace();
+                actions.append(([e.actions[step]] + e.negative_actions[step]) if step < len(e.actions) else [e.actions[-1]])
+            mask = torch.tensor([step < l for l in lens]).to(self.get_device())
+            if step == 0:
+                logz = self.estimate_values(states).squeeze(0)
+            
+            action_probs = self.score_arrows_batch(actions, states)
+            action_log_probs = F.log_softmax(action_probs, dim=1)
+            log_probs[:, step] = action_log_probs[:, 0] * mask
+        loss = ((log_probs.sum(1) - log_rews + logz) ** 2).mean()
+        return loss
 
     def get_loss(self, batch) -> torch.Tensor:
         losses = []
@@ -1260,17 +1307,6 @@ class DiversityPolicy(Policy):
 
         optimizer = torch.optim.Adam(self.parameters(), lr=self.lr)
 
-        all_negatives = []
-        # import pdb; pdb.set_trace();
-        # for e in dataset:
-        #     for i in range(len(e.actions) // 2):
-        #         all_negatives.append(e.actions[2*i:2*i+2])
-
-        # Assemble contrastive examples
-        # examples = []
-
-        # for episode in dataset:
-        #     examples.extend(self.extract_examples(episode, all_negatives))
         positives = [i for i, e in enumerate(dataset) if e.success]
         negatives = [i for i, e in enumerate(dataset) if not e.success]
         losses = []
@@ -1278,16 +1314,23 @@ class DiversityPolicy(Policy):
             optimizer.zero_grad()
             batch_pos_idx = random.sample(positives, k=min(len(positives), self.batch_size // 2))
             batch_neg_idx = random.sample(negatives, k=min(len(negatives), self.batch_size // 2))
-            batch_pos = [dataset[i] for i in batch_pos_idx]
-            batch_neg = [dataset[i] for i in batch_neg_idx]
+            batch_pos = [dataset[i] for i in batch_pos_idx if len(dataset[i].states) > 0]
+            batch_neg = [dataset[i] for i in batch_neg_idx if len(dataset[i].states) > 0]
             batch = batch_pos + batch_neg
-            # batch = random.sample(dataset, k=min(len(dataset), self.batch_size))
-            loss = self.get_loss(batch)
+            # max_len = [max(map(len, e.states)) for e in batch]
+            # import time
+            # start = time.time()
+            loss = self.get_loss_batch(batch)
+            # elapsed = time.time() - start
+            # print("Batch time: ", elapsed, "Loss: ", loss.item())
+            # start = time.time()
+            # loss = self.get_loss(batch)
+            # elapsed = time.time() - start
+            # print("Non-batched time: ", elapsed, "Loss: ", loss.item())
             loss.backward()
             optimizer.step()
             print("Loss: ", loss.item())
             losses.append(loss.item())
-            # wandb.log({'train_loss': loss.cpu()})
 
             checkpoint_callback()
         return {

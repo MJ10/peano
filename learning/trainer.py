@@ -2,6 +2,7 @@
 
 
 import os
+import glob
 import random
 import pickle
 import logging
@@ -112,7 +113,20 @@ class TrainerAgent:
                 break
 
         if not episodes:
-            print('Starting with no training episodes.')
+            if not self.config.load_trajectories:
+                print('Starting with no training episodes.')
+            else:
+                print('Loading past episodes.')
+                file_pattern = os.path.join(self.config.load_trajectories, "episodes-*.pkl")
+                matching_files = glob.glob(file_pattern)
+                if len(matching_files) == 0:
+                    print("No episodes found")
+                else:
+                    matching_files.sort(key=lambda x: int(x.split("-")[1].split(".")[0]))
+                    with open(matching_files[-1], "rb") as f:
+                        episodes = pickle.load(f)
+                    print(f"Loaded data from {matching_files[-1]}")
+
 
         for it in range(iteration, -1, -1):
             tactics_path_i = os.path.join(os.getcwd(), f'tactics-{it}.pkl')
@@ -123,7 +137,20 @@ class TrainerAgent:
                 break
 
         if not tactics:
-            print('Starting with no tactics.')
+            if not self.config.load_tactics_init:
+                print('Starting with no tactics.')
+            else:
+                print('Loading past tactics.')
+                file_pattern = os.path.join(self.config.load_tactics_init, "tactics-*.pkl")
+                matching_files = glob.glob(file_pattern)
+                if len(matching_files) == 0:
+                    print(f"No tactics found at {self.config.load_tactics_init}")
+                else:
+                    matching_files.sort(key=lambda x: int(x.split("-")[1].split(".")[0]))
+                    
+                    with open(matching_files[-1], "rb") as f:
+                        tactics = pickle.load(f)
+                    print(f"Loaded tactics from {matching_files[-1]}")
 
         device = get_device(self.config.get('gpus') and self.config.gpus[-1])
 
@@ -157,6 +184,14 @@ class TrainerAgent:
         max_nodes = self.max_nodes
         curriculum_steps = 0
         last_train_success_rate = 0
+
+        if len(episodes) > 0 and ep_it < 0:
+            # i.e we loaded episodes from a past run
+            # do some additional training in advance
+            steps = m.gradient_steps
+            m.gradient_steps = (len(episodes) // m.batch_size)
+            logs = m.fit(episodes)
+            m.gradient_steps = steps
 
         for it in range(iteration, self.config.iterations):
             metrics = {}
@@ -255,25 +290,40 @@ class TrainerAgent:
 
                     # Induce tactics from new episodes.
                     if self.config.get('induce_tactics'):
-                        for _ in range(self.config.n_tactics):
-                            proposals = induce_tactics(episodes[start_index:],
-                                                       self.config.n_tactics,
-                                                       self.config.min_tactic_score,
-                                                       tactics,
-                                                       self.config.get('induce_loops'))
-                            if proposals:
-                                # Take the top proposal, incorporate it and repeat.
-                                new_tactic = (proposals[0]
-                                              .rename(f'tactic{len(tactics):03d}'))
-
-                                logging.info('Incorporating new tactic:\n%s\n', new_tactic)
-                                tactics.append(new_tactic)
-
-                                for i, e in enumerate(episodes):
-                                    d = make_domain(e.domain, tactics)
-                                    episodes[i] = new_tactic.rewrite_episode(e, d)
+                        if self.config.load_tactics_seq:
+                            filepattern = os.path.join(self.config.load_tactics_seq, f"tactics-{it}.pkl")
+                            matching_files = glob.glob(filepattern)
+                            if len(matching_files) == 0:
+                                print(f"No tactics found at {self.config.load_tactics_seq}")
                             else:
-                                break
+                                matching_files.sort(key=lambda x: int(x.split("-")[1].split(".")[0]))
+                                with open(matching_files[-1], "rb") as f:
+                                    tactics = pickle.load(f)
+                                print(f"Loaded tactics from {matching_files[-1]}")
+                                for new_tactic in tactics:
+                                    for i, e in enumerate(episodes):
+                                        d = make_domain(e.domain, tactics)
+                                        episodes[i] = new_tactic.rewrite_episode(e, d)
+                        else:
+                            for _ in range(self.config.n_tactics):
+                                proposals = induce_tactics(episodes[start_index:],
+                                                        self.config.n_tactics,
+                                                        self.config.min_tactic_score,
+                                                        tactics,
+                                                        self.config.get('induce_loops'))
+                                if proposals:
+                                    # Take the top proposal, incorporate it and repeat.
+                                    new_tactic = (proposals[0]
+                                                .rename(f'tactic{len(tactics):03d}'))
+
+                                    logging.info('Incorporating new tactic:\n%s\n', new_tactic)
+                                    tactics.append(new_tactic)
+
+                                    for i, e in enumerate(episodes):
+                                        d = make_domain(e.domain, tactics)
+                                        episodes[i] = new_tactic.rewrite_episode(e, d)
+                                else:
+                                    break
 
                         logging.info('Recomputing negatives after tactic induction...')
                         for e in episodes:
