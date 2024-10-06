@@ -20,7 +20,7 @@ trainer:
     search_budget_multiplier: 1
     do_eval: false
     on_policy_frac: 1.
-    eval_freq: 250
+    eval_freq: 10
     iterations: 500
     batch_size: 50
     n_searchers: 12
@@ -65,6 +65,7 @@ job:
 
 hydra:
     run:
-        dir: /network/scratch/m/moksh.jain/peano_experiments/${job.name}/${now:%Y.%m.%d}/${now:%H%M%S}
+        # dir: /network/scratch/m/moksh.jain/peano_experiments/${job.name}/${now:%Y.%m.%d}/${now:%H%M%S}
+        dir: /network/scratch/m/moksh.jain/peano_experiments/${job.name}/
     job:
         chdir: true

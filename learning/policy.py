@@ -318,6 +318,7 @@ class Policy(nn.Module):
                                    
                 beam.solution = beam.solution.push_action(action, problem.domain)
                 beam.state = beam.solution.format(MAX_STATE_LENGTH)
+            torch.cuda.empty_cache()
             return recover_episode(problem, beam, False)
 
     def beam_search(self,
@@ -361,9 +362,13 @@ class Policy(nn.Module):
 
                 # 1- Expand each node in the beam and score successors.
                 actions = [s.solution.successors(problem.domain) for s in beam]
+                # if hasattr(self, 'score_arrows_batch'):
+                #     action_probs = self.score_arrows_batch([[a.value for a in a_i] for a_i in actions],
+                #                                            [s.state for s in beam]).softmax(-1)
+                # else:
                 action_probs = [(self.score_arrows([a.value for a in a_i],
-                                                   s.state) / temperature).softmax(-1)
-                                for a_i, s in zip(actions, beam)]
+                                                s.state) / temperature).softmax(-1)
+                            for a_i, s in zip(actions, beam)]
 
                 if logger.isEnabledFor(logging.DEBUG):
                     logger.debug('Arrow probabilities:')
@@ -391,7 +396,7 @@ class Policy(nn.Module):
                 for e in beam:
                     e.solution = e.solution.push_action(e.action, problem.domain)
                     e.state = e.solution.format(MAX_STATE_LENGTH)
-            # import pdb; pdb.set_trace();
+            torch.cuda.empty_cache()
             return recover_episode(problem, beam[0] if beam else None, False)# , beam[0] if beam else None
 
     def best_first_search(self, domain: Domain, problem: Problem,
@@ -1314,13 +1319,19 @@ class DiversityPolicy(Policy):
             optimizer.zero_grad()
             batch_pos_idx = random.sample(positives, k=min(len(positives), self.batch_size // 2))
             batch_neg_idx = random.sample(negatives, k=min(len(negatives), self.batch_size // 2))
-            batch_pos = [dataset[i] for i in batch_pos_idx if len(dataset[i].states) > 0]
-            batch_neg = [dataset[i] for i in batch_neg_idx if len(dataset[i].states) > 0]
+            batch_pos = [dataset[i] for i in batch_pos_idx if len(dataset[i].states) > 0 and len(dataset[i].actions) > 0 and dataset[i].negative_actions is not None]
+            batch_neg = [dataset[i] for i in batch_neg_idx if len(dataset[i].states) > 0 and len(dataset[i].actions) > 0 and dataset[i].negative_actions is not None]
             batch = batch_pos + batch_neg
-            # max_len = [max(map(len, e.states)) for e in batch]
             # import time
             # start = time.time()
-            loss = self.get_loss_batch(batch)
+            try:
+                loss = self.get_loss_batch(batch)
+            except RuntimeError as e:
+                if "out of memory" in str(e):
+                    print("WARNING: Out of memory, skipping batch")
+                    torch.cuda.empty_cache()
+                    continue
+
             # elapsed = time.time() - start
             # print("Batch time: ", elapsed, "Loss: ", loss.item())
             # start = time.time()
@@ -1330,8 +1341,8 @@ class DiversityPolicy(Policy):
             loss.backward()
             optimizer.step()
             print("Loss: ", loss.item())
-            losses.append(loss.item())
-
+            losses.append(loss.cpu().item())
+            torch.cuda.empty_cache()
             checkpoint_callback()
         return {
             "loss": sum(losses) / len(losses)

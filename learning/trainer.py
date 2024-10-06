@@ -184,7 +184,7 @@ class TrainerAgent:
         max_nodes = self.max_nodes
         curriculum_steps = 0
         last_train_success_rate = 0
-
+        # import pdb; pdb.set_trace();
         if len(episodes) > 0 and ep_it < 0:
             # i.e we loaded episodes from a past run
             # do some additional training in advance
@@ -195,6 +195,7 @@ class TrainerAgent:
 
         for it in range(iteration, self.config.iterations):
             metrics = {}
+            torch.cuda.empty_cache()
             with ProcessPoolExecutor() as executor:
                 logger.info("### Iteration %d ###", it)
 
@@ -385,7 +386,7 @@ class TrainerAgent:
                         max_nodes = self.max_nodes
 
                     last_train_success_rate = train_success_rate
-
+                torch.cuda.empty_cache()
                 # Fit model and update checkpoint.
                 logger.info('Training model on %d episodes (%d successful)',
                             len(episodes) - start_index,
