@@ -1348,6 +1348,166 @@ class DiversityPolicy(Policy):
             "loss": sum(losses) / len(losses)
         }
 
+class DiversityPolicyVerifier(DiversityPolicy):
+    def __init__(self, config):
+        super().__init__(config)
+        self._lm_verifier = nn.GRU(input_size=config.gru.embedding_size,
+                            hidden_size=config.gru.hidden_size,
+                            bidirectional=True,
+                            num_layers=config.gru.layers)
+        self._verifier_readout = nn.Sequential(
+            nn.Linear(2*config.gru.hidden_size, 2*config.gru.hidden_size),
+            nn.ReLU(),
+            nn.Linear(2*config.gru.hidden_size, 1)
+        )
+        self._verifier_embedding = nn.Embedding(128, config.gru.embedding_size)
+        self.decomposition_steps = config.decomposition_steps
+        self.verifier_dropout_prob = config.verifier_dropout_prob
+        verifier_params = list(self._lm_verifier.parameters()) + list(self._verifier_readout.parameters()) + list(self._verifier_embedding.parameters())
+        self.opt_verifier = torch.optim.Adam(verifier_params, lr=self.lr)
+
+    def verifier_embed_states(self, batch: list[str]) -> torch.Tensor:
+        return self.verifier_embed_raw([f'S{s}S' for s in batch])
+
+    def verifier_embed_raw(self, strs: list[str]) -> torch.Tensor:
+        strs = [s[:self.max_len] for s in strs]
+        outputs = []
+
+        for b in batch_strings(strs, batch_size=4096):
+            input = encode_batch(b, self.get_device(), bos=True, eos=True)
+            input = self.embedding(input.transpose(0, 1))
+            lm_output, _ = self.lm(input)
+            outputs.append(lm_output[0, :, :])
+
+        return torch.cat(outputs, dim=0)
+    
+    def score_verifier(self, states: list[str]) -> torch.Tensor:
+        logger.debug('Estimating reward for %d states, maxlen = %d',
+                     len(states), max(map(len, states)))
+        state_embedding = self.verifier_embed_states(states)
+        return self._verifier_readout(state_embedding).squeeze(1)
+
+    def get_db_loss_batch(self, batch) -> torch.Tensor:
+        lens = [len(e.actions) for e in batch]
+        max_len = max(lens)
+        log_probs = torch.zeros((len(batch), max_len), device=self.get_device())
+        potentials = torch.zeros((len(batch), max_len), device=self.get_device())
+        logFs = torch.zeros((len(batch), max_len), device=self.get_device())
+
+        for step in range(max_len):
+            states = []
+            actions = []
+            for e in batch:
+                try:
+                    states.append(e.states[step] if step < len(e.states) - 1 else e.states[-1])
+                except:
+                    import pdb; pdb.set_trace();
+                actions.append(([e.actions[step]] + e.negative_actions[step]) if step < len(e.actions) else [e.actions[-1]])
+            mask = torch.tensor([step < l for l in lens]).to(self.get_device())
+            logF = self.estimate_values(states).squeeze(0)
+            # if step == 0:
+            #     logz = self.estimate_values(states).squeeze(0)
+            action_probs = self.score_arrows_batch(actions, states)
+            action_log_probs = F.log_softmax(action_probs, dim=1)
+            log_probs[:, step] = action_log_probs[:, 0] * mask
+            with torch.no_grad():
+                potential = self.score_verifier(states)
+                potentials[:, step] = potential * mask
+                for i, l in enumerate(lens):
+                    if step == l-1:
+                        potentials[i, step] = potentials[i, :step].sum() - (0 if batch[i].success else -20)
+            logFs[:, step] = logF * mask
+        loss = logFs[:, :-1] + log_probs[:, :-1] - (potentials[:, :-1] - potentials[:, 1:]) - logFs[:, 1:]
+        # loss = ((log_probs.sum(1) - log_rews + logz) ** 2).mean()
+        return loss.pow(2).mean()
+
+    def train_verifier_step(self, batch):
+        lens = [len(e.actions) for e in batch]
+        max_len = max(lens)
+        mask_running = torch.zeros((len(batch)), device=self.get_device())
+        potentials = torch.zeros((len(batch), max_len), device=self.get_device())
+        for step in range(max_len):
+            states = []
+            actions = []
+            for e in batch:
+                try:
+                    states.append(e.states[step] if step < len(e.states) - 1 else e.states[-1])
+                except:
+                    import pdb; pdb.set_trace();
+                actions.append(([e.actions[step]] + e.negative_actions[step]) if step < len(e.actions) else [e.actions[-1]])
+            mask = torch.tensor([step < l for l in lens]).to(self.get_device())
+            potential = self.score_verifier(states)
+            potentials[:, step] = potential * mask
+            mask_r = torch.ones(len(batch), device=self.get_device()) * self.verifier_dropout_prob
+            mask_r.bernoulli_()
+            # print(mask_running, mask, mask_r)
+            for i, l in enumerate(lens):
+                if step == l-1 and l!=1:
+                    mask_r[i] = 0
+                elif l == 1:
+                    mask_r[i] = 1
+                if step == l-2:
+                    if mask_running[i] == 0:
+                        mask_r[i] = 1
+            potentials[:, step] = potentials[:, step] * mask_r
+            mask_running += mask_r * mask
+        import pdb; pdb.set_trace();
+        loss = (potentials.sum(1) * (torch.tensor(lens, device=self.get_device()) / mask_running) - torch.tensor([0. if e.success else -20. for e in batch], device=self.get_device())).pow(2).mean()
+        print(loss.item())
+        loss.backward()
+        self.opt_verifier.step()
+        return loss.item()
+
+    def fit(self,
+            dataset: list[Episode],
+            checkpoint_callback=lambda: None):
+        self.train()
+        policy_params = list(self.lm.parameters()) + list(self.arrow_readout.parameters()) + \
+            list(self.outcome_readout.parameters()) + list(self.value_readout.parameters()) + list(self.embedding.parameters())
+        optimizer = torch.optim.Adam(policy_params, lr=self.lr)
+
+        positives = [i for i, e in enumerate(dataset) if e.success]
+        negatives = [i for i, e in enumerate(dataset) if not e.success]
+        losses = []
+        all_verifier_losses = []
+        for e in range(self.gradient_steps):
+            optimizer.zero_grad()
+            batch_pos_idx = random.sample(positives, k=min(len(positives), self.batch_size // 2))
+            batch_neg_idx = random.sample(negatives, k=min(len(negatives), self.batch_size // 2))
+            batch_pos = [dataset[i] for i in batch_pos_idx if len(dataset[i].states) > 0 and len(dataset[i].actions) > 0 and dataset[i].negative_actions is not None]
+            batch_neg = [dataset[i] for i in batch_neg_idx if len(dataset[i].states) > 0 and len(dataset[i].actions) > 0 and dataset[i].negative_actions is not None]
+            batch = batch_pos + batch_neg
+
+            try:
+                loss = self.get_db_loss_batch(batch)
+            except RuntimeError as e:
+                if "out of memory" in str(e):
+                    print("WARNING: Out of memory, skipping batch")
+                    torch.cuda.empty_cache()
+                    continue
+
+            # elapsed = time.time() - start
+            # print("Batch time: ", elapsed, "Loss: ", loss.item())
+            # start = time.time()
+            # loss = self.get_loss(batch)
+            # elapsed = time.time() - start
+            # print("Non-batched time: ", elapsed, "Loss: ", loss.item())
+            verifier_losses = []
+            for _ in range(self.decomposition_steps):
+                verifier_losses.append(self.train_verifier_step(batch))
+            loss.backward()
+            optimizer.step()
+            print("Loss: ", loss.item(), "| Verifier Loss: ", np.mean(verifier_losses))
+            losses.append(loss.cpu().item())
+            all_verifier_losses.append(np.mean(verifier_losses))
+            torch.cuda.empty_cache()
+            checkpoint_callback()
+            
+        return {
+            "loss": sum(losses) / len(losses),
+            "verifier_loss": np.mean(all_verifier_losses)
+        }
+    
 
 class TestDataPreparation(unittest.TestCase):
     def test_solution_augmentation(self):

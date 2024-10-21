@@ -21,7 +21,7 @@ from utility import GRUUtilityFunction, LengthUtilityFunction, TwoStageUtilityFu
 from util import get_device
 from episode import ProofSearchEpisode
 from search import SearcherAgent, SearcherResults, run_search_on_batch, load_search_model
-from policy import ContrastivePolicy, RandomPolicy, DiversityPolicy
+from policy import ContrastivePolicy, RandomPolicy, DiversityPolicy, DiversityPolicyVerifier
 from tactics import induce_tactics, rewrite_episode_using_tactics
 
 
@@ -161,6 +161,8 @@ class TrainerAgent:
                 m = ContrastivePolicy(self.config.model)
             elif self.config.model.type == 'diversity-policy':
                 m = DiversityPolicy(self.config.model)
+            elif self.config.model.type == 'diversity-verifier':
+                m = DiversityPolicyVerifier(self.config.model)
             elif self.config.model.type == 'random-policy':
                 m = RandomPolicy()
         else:
@@ -184,7 +186,8 @@ class TrainerAgent:
         max_nodes = self.max_nodes
         curriculum_steps = 0
         last_train_success_rate = 0
-        # import pdb; pdb.set_trace();
+        start_index = (0 if self.accumulate else len(episodes))
+
         if len(episodes) > 0 and ep_it < 0:
             # i.e we loaded episodes from a past run
             # do some additional training in advance
