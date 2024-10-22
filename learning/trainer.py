@@ -44,7 +44,7 @@ def spawn_searcher(rank, iteration, domain, tactics, max_nodes, max_depth,
             return pickle.load(f)
 
     algorithm = ('policy-beam-search'
-                 if model_type in ('diversity-policy', 'contrastive-policy', 'random-policy')
+                 if model_type in ('diversity-policy', 'diversity-verifier', 'contrastive-policy', 'random-policy')
                  else 'best-first-search')
     algorithm = 'on-policy-sample' if on_policy else algorithm
 
