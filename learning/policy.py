@@ -1417,8 +1417,7 @@ class DiversityPolicyVerifier(DiversityPolicy):
                     if step == l-1:
                         potentials[i, step] = potentials[i, :step].sum() - (0 if batch[i].success else -20)
             logFs[:, step] = logF * mask
-        loss = logFs[:, :-1] + log_probs[:, :-1] - (potentials[:, :-1] - potentials[:, 1:]) - logFs[:, 1:]
-        # loss = ((log_probs.sum(1) - log_rews + logz) ** 2).mean()
+        loss = logFs[:, :-1] + log_probs[:, :-1] - potentials[:, :-1] - logFs[:, 1:]
         return loss.pow(2).mean()
 
     def train_verifier_step(self, batch):
@@ -1440,7 +1439,7 @@ class DiversityPolicyVerifier(DiversityPolicy):
             potentials[:, step] = potential * mask
             mask_r = torch.ones(len(batch), device=self.get_device()) * self.verifier_dropout_prob
             mask_r.bernoulli_()
-            # print(mask_running, mask, mask_r)
+
             for i, l in enumerate(lens):
                 if step == l-1 and l!=1:
                     mask_r[i] = 0
@@ -1451,9 +1450,10 @@ class DiversityPolicyVerifier(DiversityPolicy):
                         mask_r[i] = 1
             potentials[:, step] = potentials[:, step] * mask_r
             mask_running += mask_r * mask
-        import pdb; pdb.set_trace();
-        loss = (potentials.sum(1) * (torch.tensor(lens, device=self.get_device()) / mask_running) - torch.tensor([0. if e.success else -20. for e in batch], device=self.get_device())).pow(2).mean()
-        print(loss.item())
+
+        loss = (potentials.sum(1) * (torch.tensor(lens, device=self.get_device()) / mask_running) - \
+            torch.tensor([0. if e.success else -20. for e in batch], device=self.get_device())).pow(2).mean()
+
         loss.backward()
         self.opt_verifier.step()
         return loss.item()
