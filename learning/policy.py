@@ -1361,8 +1361,10 @@ class DiversityPolicyVerifier(DiversityPolicy):
             nn.Linear(2*config.gru.hidden_size, 1)
         )
         self._verifier_embedding = nn.Embedding(128, config.gru.embedding_size)
+        self.verifier_type = config.verifier_type
         self.decomposition_steps = config.decomposition_steps
         self.verifier_dropout_prob = config.verifier_dropout_prob
+        self.pretrain_verifier = config.pretrain_verifier
         verifier_params = list(self._lm_verifier.parameters()) + list(self._verifier_readout.parameters()) + list(self._verifier_embedding.parameters())
         self.opt_verifier = torch.optim.Adam(verifier_params, lr=self.lr)
 
@@ -1420,7 +1422,8 @@ class DiversityPolicyVerifier(DiversityPolicy):
         loss = logFs[:, :-1] + log_probs[:, :-1] - potentials[:, :-1] - logFs[:, 1:]
         return loss.pow(2).mean()
 
-    def train_verifier_step(self, batch):
+    def train_verifier_led_step(self, batch):
+        self.opt_verifier.zero_grad()
         lens = [len(e.actions) for e in batch]
         max_len = max(lens)
         mask_running = torch.zeros((len(batch)), device=self.get_device())
@@ -1438,7 +1441,7 @@ class DiversityPolicyVerifier(DiversityPolicy):
             potential = self.score_verifier(states)
             potentials[:, step] = potential * mask
             mask_r = torch.ones(len(batch), device=self.get_device()) * self.verifier_dropout_prob
-            mask_r.bernoulli_()
+            mask_r = mask_r.bernoulli_().logical_not()
 
             for i, l in enumerate(lens):
                 if step == l-1 and l!=1:
@@ -1458,6 +1461,34 @@ class DiversityPolicyVerifier(DiversityPolicy):
         self.opt_verifier.step()
         return loss.item()
 
+    def train_verifier_linear_step(self, batch):
+        self.opt_verifier.zero_grad()
+        lens = [len(e.actions) for e in batch]
+        max_len = max(lens)
+        loss = 0
+        # mask_running = torch.zeros((len(batch)), device=self.get_device())
+        potentials = torch.zeros((len(batch), max_len), device=self.get_device())
+        
+        for step in range(max_len):
+            states = []
+            actions = []
+            for e in batch:
+                try:
+                    states.append(e.states[step] if step < len(e.states) - 1 else e.states[-1])
+                except:
+                    import pdb; pdb.set_trace();
+                actions.append(([e.actions[step]] + e.negative_actions[step]) if step < len(e.actions) else [e.actions[-1]])
+            mask = torch.tensor([step < l for l in lens]).to(self.get_device())
+            potential = self.score_verifier(states)
+            potentials[:, step] = potential * mask
+            target = torch.tensor([0. if e.success else -20. for e in batch], device=self.get_device()) / torch.tensor(lens, device=self.get_device())
+            target = target * mask
+            loss += F.mse_loss(potential, target)
+
+        loss.backward()
+        self.opt_verifier.step()
+        return loss.item()
+
     def fit(self,
             dataset: list[Episode],
             checkpoint_callback=lambda: None):
@@ -1470,6 +1501,25 @@ class DiversityPolicyVerifier(DiversityPolicy):
         negatives = [i for i, e in enumerate(dataset) if not e.success]
         losses = []
         all_verifier_losses = []
+
+        if self.pretrain_verifier:
+            for e in range(self.gradient_steps):
+                verifier_losses = []
+                batch_pos_idx = random.sample(positives, k=min(len(positives), self.batch_size // 2))
+                batch_neg_idx = random.sample(negatives, k=min(len(negatives), self.batch_size // 2))
+                batch_pos = [dataset[i] for i in batch_pos_idx if len(dataset[i].states) > 0 and len(dataset[i].actions) > 0 and dataset[i].negative_actions is not None]
+                batch_neg = [dataset[i] for i in batch_neg_idx if len(dataset[i].states) > 0 and len(dataset[i].actions) > 0 and dataset[i].negative_actions is not None]
+                batch = batch_pos + batch_neg
+                if self.verifier_type== "LED":
+                    for _ in range(self.decomposition_steps):
+                        verifier_losses.append(self.train_verifier_led_step(batch))
+                elif self.verifier_type== "linear":
+                    verifier_losses.append(self.train_verifier_linear_step(batch))
+                all_verifier_losses.append(np.mean(verifier_losses))
+                print("Pretrain Verifier Loss: ", np.mean(verifier_losses))
+
+
+
         for e in range(self.gradient_steps):
             optimizer.zero_grad()
             batch_pos_idx = random.sample(positives, k=min(len(positives), self.batch_size // 2))
@@ -1485,20 +1535,19 @@ class DiversityPolicyVerifier(DiversityPolicy):
                     print("WARNING: Out of memory, skipping batch")
                     torch.cuda.empty_cache()
                     continue
-
-            # elapsed = time.time() - start
-            # print("Batch time: ", elapsed, "Loss: ", loss.item())
-            # start = time.time()
-            # loss = self.get_loss(batch)
-            # elapsed = time.time() - start
-            # print("Non-batched time: ", elapsed, "Loss: ", loss.item())
-            verifier_losses = []
-            for _ in range(self.decomposition_steps):
-                verifier_losses.append(self.train_verifier_step(batch))
+            
             loss.backward()
             optimizer.step()
-            print("Loss: ", loss.item(), "| Verifier Loss: ", np.mean(verifier_losses))
             losses.append(loss.cpu().item())
+
+            verifier_losses = []
+            if not self.pretrain_verifier:
+                if self.verifier_type== "LED":
+                    for _ in range(self.decomposition_steps):
+                        verifier_losses.append(self.train_verifier_led_step(batch))
+                elif self.verifier_type== "linear":
+                    verifier_losses.append(self.train_verifier_linear_step(batch))
+            print("Loss: ", loss.item(), "| Verifier Loss: ", np.mean(verifier_losses))
             all_verifier_losses.append(np.mean(verifier_losses))
             torch.cuda.empty_cache()
             checkpoint_callback()
