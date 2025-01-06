@@ -154,7 +154,10 @@ class TrainerAgent:
 
         device = get_device(self.config.get('gpus') and self.config.gpus[-1])
 
-        if last_checkpoint is None:
+        if last_checkpoint is not None:
+            print('Loading', last_checkpoint)
+            m = torch.load(last_checkpoint, map_location=device)
+        else:
             if self.config.model.type == 'utility':
                 m = GRUUtilityFunction(self.config.model)
             elif self.config.model.type == 'contrastive-policy':
@@ -165,9 +168,9 @@ class TrainerAgent:
                 m = DiversityPolicyVerifier(self.config.model)
             elif self.config.model.type == 'random-policy':
                 m = RandomPolicy()
-        else:
-            print('Loading', last_checkpoint)
-            m = torch.load(last_checkpoint, map_location=device)
+            if self.config.load_policy is not None:
+                t_m = torch.load(self.config.load_policy, map_location=device)
+                m.load_state_dict(t_m.state_dict())
 
         m = m.to(device)
         return m, iteration, last_checkpoint, episodes, tactics, episodes_iteration
