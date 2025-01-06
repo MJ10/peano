@@ -171,7 +171,11 @@ class TrainerAgent:
             if self.config.load_policy is not None:
                 t_m = torch.load(self.config.load_policy, map_location=device)
                 m.load_state_dict(t_m.state_dict())
-
+                # import pdb; pdb.set_trace();
+                iter_n = self.config.load_policy.split("/")[-1].split(".")[0]
+                tactics_path = "/".join(self.config.load_policy.split("/")[:-1]) + "/tactics-" + iter_n + ".pkl"
+                with open(tactics_path, "rb") as f:
+                    tactics = pickle.load(f)
         m = m.to(device)
         return m, iteration, last_checkpoint, episodes, tactics, episodes_iteration
 
@@ -265,7 +269,7 @@ class TrainerAgent:
                         if self.config.do_on_policy_eval:
                             logger.info('Evaluating on-policy...')
                             on_policy_success_rate = {}
-                            for d in self.train_domains:
+                            for d in self.eval_domains:
                                 if not os.path.exists(f'on-policy-episodes-{d}-{it}.pkl'):
                                     eval_results = run_search_on_batch(
                                         make_domain(d, tactics),
