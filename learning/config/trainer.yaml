@@ -30,6 +30,7 @@ trainer:
     max_nodes: 1000
     rerank_top_k: 200
     epsilon: 0.1
+    temper: true
     algorithm: 'policy-beam-search'
     accumulate: true
     load_policy: null
@@ -49,6 +50,7 @@ trainer:
         train_value_function: false
         solution_augmentation_probability: 0.5
         solution_augmentation_rate: 0.5
+        positives_only: false
         decomposition_steps: 4
         verifier_dropout_prob: 0.2
         verifier_type: "linear"

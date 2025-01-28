@@ -274,3 +274,28 @@ def bootstrap_mean_ci(trials, confidence):
 
     bounds = ((1 - confidence) / 2, 1 - (1 - confidence) / 2)
     return np.mean(estimates), tuple(np.quantile(estimates, bounds, method='nearest'))
+
+def format_blocks_with_indent(content, level=0, indent=4, header=1, suffix=1):
+    if isinstance(content, str):
+        return ' ' * (level * indent) + content
+    assert isinstance(content, list)
+    pieces = []
+    for i, l in enumerate(content):
+        pieces.append(format_blocks_with_indent(l, level + (i >= header and i < len(content) - suffix),
+                                                indent, header))
+    return '\n'.join(pieces)
+
+def value_color(value: float) -> str:
+    'Given a node value estimate between 0 and 1, returns a color for its node in GraphViz.'
+
+    import coloraide
+
+    BAD = coloraide.Color('#ff837a')
+    GOOD = coloraide.Color('#1c7d13')
+
+    c = BAD.mix(GOOD, value).convert('srgb')
+
+    return c.to_string(hex=True)
+
+def tqdm_if(verbose):
+    return tqdm if verbose else lambda x: x

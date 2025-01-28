@@ -341,7 +341,7 @@ class SearcherAgent:
     '''
 
     def __init__(self, domain, model, max_nodes, max_depth, epsilon,
-                 algorithm='best-first-search', debug=False):
+                 algorithm='best-first-search', temperature=1, debug=False):
 
         self.domain = domain
         self.algorithm = algorithm
@@ -350,6 +350,7 @@ class SearcherAgent:
         self.epsilon = epsilon
         self.max_depth = max_depth
         self.debug = debug
+        self.temperature = temperature
 
     def run_batch(self, seeds) -> SearcherResults:
         episodes = []
@@ -395,7 +396,12 @@ class SearcherAgent:
                     episode = self.model.on_policy_sample(
                         problem,
                         depth=self.max_depth,
-                        epsilon=self.epsilon)
+                        epsilon=self.epsilon,
+                        temperature=self.temperature)
+                elif self.algorithm == "mcts":
+                    episode = self.model.mcts_search(
+                        problem,
+                    )
 
             if episode.success:
                 logger.info('Solved %s', episode.problem)

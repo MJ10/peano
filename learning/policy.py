@@ -16,6 +16,7 @@ from torch.distributions.categorical import Categorical
 import wandb
 from tqdm import tqdm
 import numpy as np
+import math
 
 from environment import Universe
 from util import log, softmax, pop_max, batch_strings, encode_batch, decode_batch, PAD, EOS, BOS, POSITIVE, NEGATIVE, EMPTY
@@ -182,6 +183,76 @@ class Episode:
             solution = solution.push_action(positive_a, domain)
 
         self.negative_actions = negatives
+
+class MCTSNode:
+    def __init__(self, state, prior: float = 0, exploration_constant: float = 1.0):
+        self.state = state
+        self.prior = prior
+        self.visit_count = 0
+        self.value_sum = 0
+        self.children = {}  # action -> MCTSNode
+        self.is_terminal = False
+        self.exploration_constant = exploration_constant
+        
+    def value(self) -> float:
+        if self.visit_count == 0:
+            return 0
+        return self.value_sum / self.visit_count
+    
+    def ucb_score(self, parent_visit_count: int) -> float:
+        if self.visit_count == 0:
+            return float('inf')
+        # UCB formula: Q + c * P * sqrt(N) / (1 + n)
+        exploitation = self.value()
+        exploration = self.exploration_constant * self.prior * math.sqrt(parent_visit_count) / (1 + self.visit_count)
+        return exploitation + exploration
+
+def select(node: MCTSNode) -> tuple[list[tuple[MCTSNode, str]], MCTSNode]:
+    path = []
+    while node.children and not node.is_terminal:
+        if len(node.children) == 0:
+            break
+            
+        # Select action with highest UCB score
+        best_action = max(node.children.items(),
+                        key=lambda item: item[1].ucb_score(node.visit_count))[0]
+        path.append((node, best_action))
+        node = node.children[best_action]
+        
+    return path, node
+
+def expand(node: MCTSNode, domain: Domain, policy, temperature):
+    if node.is_terminal:
+        return
+    
+    actions = node.state.solution.successors(domain)
+    if len(actions) == 0:
+        node.is_terminal = True
+        return
+    
+    # Get action probabilities from policy network
+    action_probs = (policy.score_arrows([a.value for a in actions], node.state.state) / 
+                    temperature).softmax(-1)
+    
+    # Create child nodes for each action
+    for action, prob in zip(actions, action_probs):
+        if action.value not in node.children:
+            new_state = BeamElement(
+                solution=node.state.solution,
+                state=node.state.state,
+                action=action,
+                logprob=node.state.logprob,
+                parent=node.state,
+                negative_actions=[a.value for a in actions if a != action]
+            )
+            new_state.solution = new_state.solution.push_action(action, domain)
+            new_state.state = new_state.solution.format(MAX_STATE_LENGTH)
+            node.children[action.value] = MCTSNode(new_state, prob.item())
+
+def backpropagate(path: list[tuple[MCTSNode, str]], leaf_value: float) -> None:
+    for node, _ in path:
+        node.value_sum += leaf_value
+        node.visit_count += 1
 
 
 @dataclass
@@ -470,6 +541,71 @@ class Policy(nn.Module):
     def embed_outcomes(self, batch: list[str]) -> torch.Tensor:
         batch = batch or [EMPTY]
         return self.embed_raw([f'O{s}O' for s in batch])
+
+    def mcts_search(self,
+                    problem: Problem,
+                    num_simulations: int = 100,
+                    max_depth: int = 50,
+                    exploration_constant: float = 1.0,
+                    temperature: float = 1.0) -> Episode:
+        """
+        Performs Monte Carlo Tree Search using the policy network for action selection and value estimation.
+        
+        Args:
+            problem: The problem to solve
+            num_simulations: Number of MCTS simulations to run
+            max_depth: Maximum depth of the search tree
+            exploration_constant: Controls exploration in UCB formula
+            temperature: Temperature for policy sampling
+        """
+
+        # Initialize root node
+        initial_sol = Solution.from_problem(problem)
+        root = MCTSNode(BeamElement(solution=initial_sol,
+                                   state=initial_sol.format(MAX_STATE_LENGTH),
+                                   logprob=0.0), exploration_constant=exploration_constant)
+
+        # Run MCTS simulations
+        with torch.no_grad():
+            for _ in range(num_simulations):
+                path, leaf = select(root)
+                
+                # Check if we've reached a terminal state or max depth
+                if len(path) >= max_depth:
+                    leaf.is_terminal = True
+                
+                if not leaf.is_terminal:
+                    expand(leaf, problem.domain, self, temperature)
+                    
+                # Check if solution is found
+                if problem.domain.derivation_done(leaf.state.solution.derivation):
+                    leaf.is_terminal = True
+                    leaf_value = 1.0
+                else:
+                    # Use value network to estimate state value
+                    leaf_value = self.estimate_values([leaf.state.state]).item()
+                    
+                backpropagate(path, leaf_value)
+
+        # Select best action sequence from root
+        current = root
+        best_episode = None
+        while current.children and not current.is_terminal:
+            # Select action with highest visit count
+            best_action = max(current.children.items(),
+                             key=lambda item: item[1].visit_count)[0]
+            current = current.children[best_action]
+            
+            # Check if we found a solution
+            if problem.domain.derivation_done(current.state.solution.derivation):
+                best_episode = recover_episode(problem, current.state, True)
+                break
+
+        if best_episode is None:
+            best_episode = recover_episode(problem, current.state, False)
+
+        return best_episode
+
 
 class RNNObservationEmbedding(nn.Module):
     def __init__(self, config):
@@ -866,6 +1002,12 @@ class ContrastivePolicyExample:
                 sum(map(len, self.negatives or [])))
 
 
+@dataclass
+class DBExample:
+    state: str
+    actions: str = None
+    next_state: str = None
+
 class ContrastivePolicy(Policy):
     def __init__(self, config):
         super().__init__()
@@ -1111,6 +1253,7 @@ class DiversityPolicy(Policy):
         self.gradient_steps = config.gradient_steps
         self.solution_augmentation_probability = config.solution_augmentation_probability
         self.solution_augmentation_rate = config.solution_augmentation_rate
+        self.positives_only = config.positives_only
 
 
     def score_arrows(self, arrows: list[str], state: str) -> torch.Tensor:
@@ -1156,14 +1299,19 @@ class DiversityPolicy(Policy):
             for i, a in enumerate(episode.actions):
                 if episode.success:
                     if episode.negative_actions[i]:
-                        examples.append(ContrastivePolicyExample(type=ExampleType.STATE_ACTION,
-                                                                 state=episode.states[i],
-                                                                 positive=a,
-                                                                 negatives=episode.negative_actions[i]))
+                        examples.append(DBExample(
+                            state=episode.states[i],
+                            actions=[a] + episode.negative_actions[i],
+                            next_state=episode.states[i+1]
+                        ))
+                        # examples.append(ContrastivePolicyExample(type=ExampleType.STATE_ACTION,
+                        #                                          state=episode.states[i],
+                        #                                          positive=a,
+                        #                                          negatives=episode.negative_actions[i]))
 
-                        if random_negatives and \
-                           random.random() < self.solution_augmentation_probability:
-                            examples.extend(self._perform_augmentation(episode, random_negatives))
+                        # if random_negatives and \
+                        #    random.random() < self.solution_augmentation_probability:
+                        #     examples.extend(self._perform_augmentation(episode, random_negatives))
 
             if self.train_value_function:
                 for i, s in enumerate(episode.states):
@@ -1317,13 +1465,16 @@ class DiversityPolicy(Policy):
         losses = []
         for e in range(self.gradient_steps):
             optimizer.zero_grad()
-            batch_pos_idx = random.sample(positives, k=min(len(positives), self.batch_size // 2))
-            batch_neg_idx = random.sample(negatives, k=min(len(negatives), self.batch_size // 2))
+            if not self.positives_only:
+                batch_pos_idx = random.sample(positives, k=min(len(positives), self.batch_size // 2))
+                batch_neg_idx = random.sample(negatives, k=min(len(negatives), self.batch_size // 2))
+            else:
+                batch_pos_idx = random.sample(positives, k=min(len(positives), self.batch_size))
+                batch_neg_idx = []
             batch_pos = [dataset[i] for i in batch_pos_idx if len(dataset[i].states) > 0 and len(dataset[i].actions) > 0 and dataset[i].negative_actions is not None]
             batch_neg = [dataset[i] for i in batch_neg_idx if len(dataset[i].states) > 0 and len(dataset[i].actions) > 0 and dataset[i].negative_actions is not None]
             batch = batch_pos + batch_neg
-            # import time
-            # start = time.time()
+
             try:
                 loss = self.get_loss_batch(batch)
             except RuntimeError as e:
@@ -1344,9 +1495,12 @@ class DiversityPolicy(Policy):
             losses.append(loss.cpu().item())
             torch.cuda.empty_cache()
             checkpoint_callback()
+            
         return {
-            "loss": sum(losses) / len(losses)
+            "loss": sum(losses) / len(losses),
+            # "verifier_loss": np.mean(all_verifier_losses)
         }
+    
 
 class DiversityPolicyVerifier(DiversityPolicy):
     def __init__(self, config):

@@ -6,6 +6,7 @@ import glob
 import random
 import pickle
 import numpy as np
+import numpy as np
 import logging
 import itertools
 from concurrent.futures import ProcessPoolExecutor
@@ -33,7 +34,7 @@ MAX_NODES_LIMIT = 50000
 
 
 def spawn_searcher(rank, iteration, domain, tactics, max_nodes, max_depth,
-                   epsilon, model_type, model_path, seeds, device, out_path=None, algorithm=None, on_policy=False):
+                   epsilon, model_type, model_path, seeds, device, out_path=None, algorithm=None, on_policy=False, temper=False):
     if out_path is None:
         out_path = (f'rollouts/it{iteration}/searcher{rank}.pt'
                     if rank is not None
@@ -54,11 +55,11 @@ def spawn_searcher(rank, iteration, domain, tactics, max_nodes, max_depth,
                     else 'best-first-search')
         algorithm = 'on-policy-sample' if on_policy else algorithm
     
-
+    temperature = np.random.uniform(0.1, 2) if temper else 1
     agent = SearcherAgent(make_domain(domain, tactics),
                           m, max_nodes, max_depth,
                           epsilon=epsilon,
-                          algorithm=algorithm)
+                          algorithm=algorithm, temperature=temperature)
 
     episodes = agent.run_batch(seeds)
     print(out_path)
@@ -89,6 +90,7 @@ class TrainerAgent:
         self.accumulate = config.accumulate
         self.epsilon = config.epsilon
         self.config = config
+        self.temper = config.temper
         self.searcher_futures = []
 
     def start(self):
@@ -159,10 +161,12 @@ class TrainerAgent:
                     with open(matching_files[-1], "rb") as f:
                         tactics = pickle.load(f)
                     print(f"Loaded tactics from {matching_files[-1]}")
-
         device = get_device(self.config.get('gpus') and self.config.gpus[-1])
 
-        if last_checkpoint is None:
+        if last_checkpoint is not None:
+            print('Loading', last_checkpoint)
+            m = torch.load(last_checkpoint, map_location=device)
+        else:
             if self.config.model.type == 'utility':
                 m = GRUUtilityFunction(self.config.model)
             elif self.config.model.type == 'contrastive-policy':
@@ -173,9 +177,14 @@ class TrainerAgent:
                 m = DiversityPolicyVerifier(self.config.model)
             elif self.config.model.type == 'random-policy':
                 m = RandomPolicy()
-        else:
-            print('Loading', last_checkpoint)
-            m = torch.load(last_checkpoint, map_location=device)
+            if self.config.load_policy is not None:
+                t_m = torch.load(self.config.load_policy, map_location=device)
+                m.load_state_dict(t_m.state_dict())
+                # import pdb; pdb.set_trace();
+                iter_n = self.config.load_policy.split("/")[-1].split(".")[0]
+                tactics_path = "/".join(self.config.load_policy.split("/")[:-1]) + "/tactics-" + iter_n + ".pkl"
+                with open(tactics_path, "rb") as f:
+                    tactics = pickle.load(f)
 
         m = m.to(device)
         return m, iteration, last_checkpoint, episodes, tactics, episodes_iteration
@@ -203,9 +212,10 @@ class TrainerAgent:
             m.gradient_steps = (len(episodes) // m.batch_size)
             logs = m.fit(episodes)
             m.gradient_steps = steps
-        train_executor = ProcessPoolExecutor()
-        test_executor = ProcessPoolExecutor()
+        
         for it in range(iteration, self.config.iterations):
+            train_executor = ProcessPoolExecutor()
+            test_executor = ProcessPoolExecutor()
             metrics = {}
             torch.cuda.empty_cache()
             # with ProcessPoolExecutor() as executor:
@@ -241,6 +251,7 @@ class TrainerAgent:
                         'seeds': random.choices(seeds, k=self.batch_size),
                         'device': self._get_searcher_device(j),
                         'on_policy': is_on_policy[j],
+                        'temper': self.temper
                     }
                     logging.info('Searcher parameters: %s', str(params))
                     self.searcher_futures.append(train_executor.submit(spawn_searcher,
@@ -278,41 +289,36 @@ class TrainerAgent:
                                     test_futures[d].append(test_executor.submit(spawn_searcher,
                                                                     **params))
 
-                                # eval_results = run_search_on_batch(
-                                #     make_domain(d, tactics),
-                                #     eval_seeds,
-                                #     m,
-                                #     self.algorithm,
-                                #     self.max_nodes,
-                                #     self.max_depth,
-                                #     output_path=f'eval-episodes-{d}-{it}.pkl',
-                                #     debug=False,
-                                #     epsilon=0,
-                                # )
-                                # wandb.log({f'success_rate_{d}': eval_results.success_rate()})
-                                # success_rate[d] = eval_results.success_rate()
-                                # metrics.update({f'success_rate_{d}': eval_results.success_rate()})
-                                # logger.info('Evaluated %s: %f', d, eval_results.success_rate())
                     if self.config.do_on_policy_eval:
                         logger.info('Evaluating on-policy...')
+                        on_policy_test_futures = {}
                         on_policy_success_rate = {}
-                        for d in self.train_domains:
-                            if not os.path.exists(f'on-policy-episodes-{d}-{it}.pkl'):
-                                eval_results = run_search_on_batch(
-                                    make_domain(d, tactics),
-                                    eval_seeds,
-                                    m,
-                                    self.algorithm,
-                                    self.max_nodes,
-                                    self.max_depth,
-                                    output_path=f'on-policy-eval-episodes-{d}-{it}.pkl',
-                                    debug=False,
-                                    epsilon=0,
-                                    on_policy=True
-                                )
-                                on_policy_success_rate[d] = eval_results.success_rate()
-                                metrics.update({f'on_policy_success_rate_{d}': eval_results.success_rate()})
-                                logger.info('Evaluated %s: %f', d, eval_results.success_rate())
+                        for d in self.eval_domains:
+                            on_policy_test_futures[d] = []
+                            num_test_searchers = len(eval_seeds) // 50
+                            if not os.path.exists(f'op-eval-episodes-{d}-{it}.pkl'):
+                                for i in range(num_test_searchers):
+                                    eval_seeds_i = eval_seeds[i*50:(i+1)*50]
+                                    params = {
+                                        'iteration': it,
+                                        'rank': i,
+                                        'domain': d,
+                                        'tactics': tactics,
+                                        'max_nodes': max_nodes,
+                                        'max_depth': self.max_depth,
+                                        'epsilon': 0,
+                                        'model_type': self.model_type,
+                                        'model_path': last_checkpoint,
+                                        'seeds': eval_seeds_i,
+                                        'out_path': f'rollouts/op-eval-episodes-{d}-{it}-{i}.pkl',
+                                        'algorithm': self.algorithm,
+                                        'device': self._get_searcher_device(i),
+                                        'on_policy': True,
+                                    }
+                                    logging.info('Searcher parameters: %s', str(params))
+                                    on_policy_test_futures[d].append(test_executor.submit(spawn_searcher,
+                                                                    **params))
+
                     if it % self.config.eval_freq == 0:
                         if self.config.do_eval:
                             for k, futures in test_futures.items():
@@ -328,6 +334,21 @@ class TrainerAgent:
                                         continue
                                 metrics.update({f'success_rate_{k}': np.mean(success_rates)})
                                 logger.info('Evaluated %s: %f', k, np.mean(success_rates))
+                        
+                        if self.config.do_on_policy_eval:
+                            for k, futures in on_policy_test_futures.items():
+                                on_policy_success_rate = []
+                                for future in futures:
+                                    try:
+                                        eval_results = future.result()
+                                        eps = eval_results.episodes
+                                        success_rates.append(sum([e.success for e in eps]) / len(eps))
+                                    except BrokenProcessPool as e:
+                                        logger.warning('Searcher failed: %s. Ignoring results...',
+                                                    str(e))
+                                        continue
+                                metrics.update({f'on_policy_success_rate_{k}': np.mean(success_rates)})
+                                logger.info('Evaluated on policy %s: %f', k, np.mean(success_rates))
                 existing_episodes = len(episodes)
                 # beams = []
                 # Aggregate episodes from searchers.
@@ -447,7 +468,8 @@ class TrainerAgent:
             metrics.update({k: v for k, v in logs.items()})
             
             
-
+            train_executor.shutdown()
+            test_executor.shutdown()
             print(metrics)
             wandb.log(metrics)
             torch.save(m, last_checkpoint)
