@@ -247,7 +247,7 @@ def expand(node: MCTSNode, domain: Domain, policy, temperature):
             )
             new_state.solution = new_state.solution.push_action(action, domain)
             new_state.state = new_state.solution.format(MAX_STATE_LENGTH)
-            node.children[action.value] = MCTSNode(new_state, prob.item())
+            node.children[action.value] = MCTSNode(new_state, prob.item(), exploration_constant=node.exploration_constant)
 
 def backpropagate(path: list[tuple[MCTSNode, str]], leaf_value: float) -> None:
     for node, _ in path:
@@ -680,6 +680,9 @@ class RandomPolicy(Policy):
     def fit(self, *args, **kwargs):
         pass
 
+    def estimate_values(self, states: list[str]) -> torch.Tensor:
+        return torch.zeros((len(states),))
+
 
 class ConstantPolicy(Policy):
     'Used for debugging.'
@@ -1007,6 +1010,7 @@ class DBExample:
     state: str
     actions: str = None
     next_state: str = None
+    is_terminal: bool = False
 
 class ContrastivePolicy(Policy):
     def __init__(self, config):
@@ -1254,6 +1258,7 @@ class DiversityPolicy(Policy):
         self.solution_augmentation_probability = config.solution_augmentation_probability
         self.solution_augmentation_rate = config.solution_augmentation_rate
         self.positives_only = config.positives_only
+        self.loss = config.loss
 
 
     def score_arrows(self, arrows: list[str], state: str) -> torch.Tensor:
@@ -1302,7 +1307,8 @@ class DiversityPolicy(Policy):
                         examples.append(DBExample(
                             state=episode.states[i],
                             actions=[a] + episode.negative_actions[i],
-                            next_state=episode.states[i+1]
+                            next_state=episode.states[i+1],
+                            is_terminal=i == len(episode.actions) - 1
                         ))
                         # examples.append(ContrastivePolicyExample(type=ExampleType.STATE_ACTION,
                         #                                          state=episode.states[i],
@@ -1313,13 +1319,13 @@ class DiversityPolicy(Policy):
                         #    random.random() < self.solution_augmentation_probability:
                         #     examples.extend(self._perform_augmentation(episode, random_negatives))
 
-            if self.train_value_function:
-                for i, s in enumerate(episode.states):
-                    value = (0 if not episode.success
-                             else self.discount ** (len(episode.states) - (i + 1)))
-                    examples.append(ContrastivePolicyExample(type=ExampleType.STATE_VALUE,
-                                                             state=episode.states[i],
-                                                             value=value))
+            # if self.train_value_function:
+            #     for i, s in enumerate(episode.states):
+            #         value = (0 if not episode.success
+            #                  else self.discount ** (len(episode.states) - (i + 1)))
+            #         examples.append(ContrastivePolicyExample(type=ExampleType.STATE_VALUE,
+            #                                                  state=episode.states[i],
+            #                                                  value=value))
         elif isinstance(episode, TreeSearchEpisode):
             for node in episode.visited:
                 examples.append(ContrastivePolicyExample(type=ExampleType.STATE_VALUE,
@@ -1424,6 +1430,43 @@ class DiversityPolicy(Policy):
         loss = ((log_probs.sum(1) - log_rews + logz) ** 2).mean()
         return loss
 
+    def get_db_loss_batch(self, batch) -> torch.Tensor:
+        states = [example.state for example in batch]
+        actions = [example.actions for example in batch]
+        next_states = [example.next_state for example in batch]
+        mask = torch.tensor([not example.is_terminal for example in batch], device=self.get_device())
+
+        logF = self.estimate_values(states).squeeze(0)
+        logF_next = self.estimate_values(next_states).squeeze(0)
+        action_probs = self.score_arrows_batch(actions, states)
+        action_log_probs = F.log_softmax(action_probs, dim=1)
+        log_pfs = action_log_probs[:, 0]
+        loss = (logF - logF_next + log_pfs) ** 2
+
+        return loss.mean()
+
+    def get_neg_loss_batch(self, batch) -> torch.Tensor:
+        lens = [len(e.actions) for e in batch]
+        max_len = max(lens)
+        log_probs = torch.zeros((len(batch), max_len), device=self.get_device())
+
+        for step in range(max_len):
+            states = []
+            actions = []
+            for e in batch:
+                try:
+                    states.append(e.states[step] if step < len(e.states) - 1 else e.states[-1])
+                except:
+                    import pdb; pdb.set_trace();
+                actions.append(([e.actions[step]] + e.negative_actions[step]) if step < len(e.actions) else [e.actions[-1]])
+            mask = torch.tensor([step < l for l in lens]).to(self.get_device())
+            
+            action_probs = self.score_arrows_batch(actions, states)
+            action_log_probs = F.log_softmax(action_probs, dim=1)
+            log_probs[:, step] = action_log_probs[:, 0] * mask
+        loss = (log_probs.sum(1)).mean()
+        return loss
+
     def get_loss(self, batch) -> torch.Tensor:
         losses = []
         for ep in batch:
@@ -1453,9 +1496,9 @@ class DiversityPolicy(Policy):
 
         return torch.cat(outputs, dim=0)
 
-    def fit(self,
-            dataset: list[Episode],
-            checkpoint_callback=lambda: None):
+    def fit_tb(self,
+               dataset: list[Episode],
+               checkpoint_callback=lambda: None):
         self.train()
 
         optimizer = torch.optim.Adam(self.parameters(), lr=self.lr)
@@ -1463,6 +1506,7 @@ class DiversityPolicy(Policy):
         positives = [i for i, e in enumerate(dataset) if e.success]
         negatives = [i for i, e in enumerate(dataset) if not e.success]
         losses = []
+        neg_losses = []
         for e in range(self.gradient_steps):
             optimizer.zero_grad()
             if not self.positives_only:
@@ -1491,16 +1535,84 @@ class DiversityPolicy(Policy):
             # print("Non-batched time: ", elapsed, "Loss: ", loss.item())
             loss.backward()
             optimizer.step()
+            # if self.positives_only:
+            #     neg_loss = self.train_negatives(negatives, dataset, optimizer)
+            #     neg_losses.append(neg_loss.item())
+            # print("Loss: ", loss.item(), "Neg loss: ", neg_loss.item())
             print("Loss: ", loss.item())
             losses.append(loss.cpu().item())
             torch.cuda.empty_cache()
             checkpoint_callback()
-            
+        
         return {
-            "loss": sum(losses) / len(losses),
-            # "verifier_loss": np.mean(all_verifier_losses)
+            "loss": sum(losses) / len(losses)
         }
+        # return {
+        #     "loss": sum(losses) / len(losses),
+        #     "neg_loss": sum(neg_losses) / len(neg_losses)
+        # } if self.positives_only else {
+        #     "loss": sum(losses) / len(losses)
+        # }
+
+    def fit_db(self,
+               dataset: list[Episode],
+               checkpoint_callback=lambda: None):
+        self.train()
+        optimizer = torch.optim.Adam(self.parameters(), lr=self.lr)
+        all_negatives = []
+
+        for e in dataset:
+            for i in range(len(e.actions) // 2):
+                all_negatives.append(e.actions[2*i:2*i+2])
+
+        # Assemble contrastive examples
+        examples = []
+
+        # import pdb; pdb.set_trace();
+        for episode in dataset:
+            examples.extend(self.extract_examples(episode, all_negatives))
+        
+        losses = []
+        for e in range(self.gradient_steps):
+            optimizer.zero_grad()
+            batch = random.sample(examples, k=min(len(examples), self.batch_size))
+            loss = self.get_db_loss_batch(batch)
+            loss.backward()
+            optimizer.step()
+            losses.append(loss.item())
+            # wandb.log({'train_loss': loss.cpu()})
+
+            checkpoint_callback()
+        return {
+            'loss': np.mean(losses),
+        }
+
+    def fit(self,
+            dataset: list[Episode],
+            checkpoint_callback=lambda: None):
+        if self.loss == "tb":
+            return self.fit_tb(dataset, checkpoint_callback)
+        elif self.loss == "db":
+            return self.fit_db(dataset, checkpoint_callback)
+        
     
+    def train_negatives(self, negatives, dataset, optimizer):
+        batch_neg_idx = random.sample(negatives, k=min(len(negatives), self.batch_size))
+        batch_neg = [dataset[i] for i in batch_neg_idx if len(dataset[i].states) > 0 and len(dataset[i].actions) > 0 and dataset[i].negative_actions is not None]
+
+        try:
+            # loss = self.get_loss_batch(batch)
+            loss = self.get_neg_loss_batch(batch_neg)
+        except RuntimeError as e:
+            if "out of memory" in str(e):
+                print("WARNING: Out of memory, skipping batch")
+                torch.cuda.empty_cache()
+        
+        loss.backward()
+        optimizer.step()
+
+        return loss.cpu()
+
 
 class DiversityPolicyVerifier(DiversityPolicy):
     def __init__(self, config):

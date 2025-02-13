@@ -44,7 +44,7 @@ def spawn_searcher(rank, iteration, domain, tactics, max_nodes, max_depth,
                 # else None)
 
     m = load_search_model(model_type, model_path, device=device)
-
+    print(out_path, model_path, m)
     if out_path is not None and os.path.exists(out_path):
         with open(out_path, 'rb') as f:
             return pickle.load(f)

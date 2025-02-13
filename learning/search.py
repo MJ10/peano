@@ -418,7 +418,7 @@ def run_search_on_batch(domain, seeds, model, algorithm, max_nodes,
     if on_policy:
         algorithm = 'on-policy-sample'
     searcher = SearcherAgent(domain, model, max_nodes, max_depth,
-                             epsilon, algorithm, debug)
+                             epsilon, algorithm, debug=debug)
 
     result = searcher.run_batch(seeds)
     print(f'Solved {result.successes()}/{len(seeds)}')

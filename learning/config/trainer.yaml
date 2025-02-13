@@ -55,6 +55,7 @@ trainer:
         verifier_dropout_prob: 0.2
         verifier_type: "linear"
         pretrain_verifier: false
+        loss: "db"
 
         gru:
             embedding_size: 64
